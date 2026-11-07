@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Unlock all context-window gates in the agy CLI (plus optional env-var restore).
 
-Verified end-to-end on macOS (arm64), Windows (x86-64 & arm64) and Linux (x86-64),
-agy 1.4.12 - 1.5.2. Container + Go pclntab locating supports Mach-O, ELF, and PE
-(arm64 & x86-64).
+Verified end-to-end on macOS (arm64), Linux (x86-64 & arm64), and Windows
+(x86-64 & arm64), agy 1.4.12 - 1.5.3. Container + Go pclntab locating supports
+Mach-O, ELF, and PE (arm64 & x86-64).
 
 Gate 1 -- model.SelectorModel.offersContextWindow
     Exposes /model -> Context: [Default] [256K] [512K] [900K] (Tab key) for all
@@ -39,8 +39,6 @@ Gate 4A -- chatconverters.(*TrajectoryChatConverter).getMaxTokensForStep
     and 19, while preserving MaxTokensPerStep = 16,384 for non-user/tool steps.
         arm64 : mov x2, xzr ; b <epilogue mv x0,x2> at the USER_INPUT branch
         x86-64: xor %eax, %eax ; jmp <epilogue dealloc>
-    On Linux x86-64 this body is inlined into a sibling, so the dispatch is
-    located through the other methods on the same receiver type.
 
 Gate 4B -- serializers.DefaultSerializer.stepToMessage (OneHarness, agy >= 1.5.0)
     Routes STEP_TYPE_USER_INPUT (0xe) to the zero-token-limit branch so the
@@ -159,6 +157,91 @@ def _macho_text(data):
     raise PatchError("__text section not found in Mach-O")
 
 
+def _elf_file_to_va(data, file_off):
+    phoff = struct.unpack_from("<Q", data, 32)[0]
+    phentsize, phnum = struct.unpack_from("<HH", data, 54)
+    for i in range(phnum):
+        ph = phoff + i * phentsize
+        if ph + 40 > len(data):
+            break
+        if struct.unpack_from("<I", data, ph)[0] != 1:  # PT_LOAD
+            continue
+        p_offset, p_vaddr, _p_paddr, p_filesz = struct.unpack_from("<QQQQ", data, ph + 8)
+        if p_offset <= file_off < p_offset + p_filesz:
+            return p_vaddr + (file_off - p_offset)
+    return None
+
+
+def _elf_go_text_va(data, t_va, t_sz, relas, symtabs):
+    """Locate Go `runtime.text` inside ELF `.text`.
+
+    External C linkers (glibc / musl cgo PIE) place CRT startup stubs at the
+    head of `.text` (`+0x80` on glibc x86-64, `+0xc0` on musl x86-64 and glibc
+    arm64), while Go `functab` `entryoff` values are relative to `runtime.text`.
+    """
+    pcln_off, _ = find_pclntab(data)
+    text_start, funcname_off = struct.unpack_from("<QQ", data, pcln_off + 24)
+    if t_va <= text_start < t_va + t_sz:
+        return text_start
+
+    pcln_va = _elf_file_to_va(data, pcln_off)
+    if pcln_va is not None:
+        fn_va = pcln_va + funcname_off
+        needle = struct.pack("<q", pcln_va)
+        for roff, rsz, entsz in relas:
+            pos = roff
+            end = roff + rsz
+            while True:
+                hit = data.find(needle, pos, end)
+                if hit < 0:
+                    break
+                pos = hit + 1
+                if (hit - roff) % entsz != 16:
+                    continue
+                ep = hit - 16
+                if ep + 2 * entsz > end:
+                    continue
+                mod_va = struct.unpack_from("<Q", data, ep)[0]
+                r_off2, _, r_add2 = struct.unpack_from("<QQq", data, ep + entsz)
+                if r_off2 != mod_va + 8 or r_add2 != fn_va:
+                    continue
+                mod_text = mod_etext = None
+                for k in range(2, 24):
+                    if ep + (k + 1) * entsz > end:
+                        break
+                    ro, _, ra = struct.unpack_from("<QQq", data, ep + k * entsz)
+                    if ro == mod_va + 0xB0:
+                        mod_text = ra
+                    elif ro == mod_va + 0xB8:
+                        mod_etext = ra
+                if (mod_text is not None and mod_etext is not None
+                        and t_va <= mod_text < mod_etext <= t_va + t_sz):
+                    return mod_text
+
+        pair = struct.pack("<QQ", pcln_va, fn_va)
+        pos = 0
+        while True:
+            hit = data.find(pair, pos)
+            if hit < 0 or hit + 0xC0 > len(data):
+                break
+            pos = hit + 1
+            mod_text, mod_etext = struct.unpack_from("<QQ", data, hit + 0xB0)
+            if t_va <= mod_text < mod_etext <= t_va + t_sz:
+                return mod_text
+
+    for sym_off, sym_sz, entsz, str_off in symtabs:
+        for pos in range(sym_off, sym_off + sym_sz, entsz):
+            if pos + 24 > len(data):
+                break
+            st_name, _info, _other, _shndx, st_val, _sz = struct.unpack_from("<IBBHQQ", data, pos)
+            end = data.find(b"\0", str_off + st_name, str_off + st_name + 64)
+            if end > 0 and data[str_off + st_name:end] == b"runtime.text":
+                if t_va <= st_val < t_va + t_sz:
+                    return st_val
+
+    raise PatchError("cannot locate Go runtime.text base in ELF")
+
+
 def _elf_text(data):
     if data[4] != 2 or data[5] != 1:
         raise PatchError("only 64-bit little-endian ELF is supported")
@@ -169,14 +252,32 @@ def _elf_text(data):
     shoff = struct.unpack_from("<Q", data, 40)[0]
     shentsize, shnum, shstrndx = struct.unpack_from("<HHH", data, 58)
     strtab_off = struct.unpack_from("<Q", data, shoff + shstrndx * shentsize + 24)[0]
+    text_sec = None
+    relas = []
+    symtabs = []
     for i in range(shnum):
         sh = shoff + i * shentsize
-        nameoff = struct.unpack_from("<I", data, sh)[0]
+        nameoff, sh_type = struct.unpack_from("<II", data, sh)
         end = data.find(b"\0", strtab_off + nameoff)
         if data[strtab_off + nameoff:end] == b".text":
-            addr, offset = struct.unpack_from("<QQ", data, sh + 16)
-            return addr, offset, arch
-    raise PatchError(".text section not found in ELF")
+            addr, offset, size = struct.unpack_from("<QQQ", data, sh + 16)
+            text_sec = (addr, offset, size)
+        elif sh_type == 4:  # SHT_RELA
+            r_off, r_sz = struct.unpack_from("<QQ", data, sh + 24)
+            r_ent = struct.unpack_from("<Q", data, sh + 56)[0] or 24
+            relas.append((r_off, r_sz, r_ent))
+        elif sh_type == 2:  # SHT_SYMTAB
+            s_off, s_sz = struct.unpack_from("<QQ", data, sh + 24)
+            s_link = struct.unpack_from("<I", data, sh + 40)[0]
+            s_ent = struct.unpack_from("<Q", data, sh + 56)[0] or 24
+            if s_link < shnum:
+                s_str = struct.unpack_from("<Q", data, shoff + s_link * shentsize + 24)[0]
+                symtabs.append((s_off, s_sz, s_ent, s_str))
+    if text_sec is None:
+        raise PatchError(".text section not found in ELF")
+    t_va, t_off, t_sz = text_sec
+    go_va = _elf_go_text_va(data, t_va, t_sz, relas, symtabs)
+    return go_va, t_off + (go_va - t_va), arch
 
 
 def _pe_text(data):
@@ -593,16 +694,12 @@ def patch_gate3b_exp_checkpoint(data, funcs, text_va, text_off, arch):
     # x86-64: bypass HasFlag(expKey) `test %al,%al ; jne ...` after selectCheckpointExperimentKey
     if FUNC_SELECT_EXP_KEY not in funcs:
         raise PatchError(f"symbol not found: {FUNC_SELECT_EXP_KEY}")
-    sel_off, sel_size = funcs[FUNC_SELECT_EXP_KEY]
-    sel_va = text_va + sel_off
-    # Go may split a function, and a call can target an entry point inside the
-    # symbol instead of its first byte, so accept the whole symbol range.
-    sel_end = sel_va + max(sel_size, 1)
+    sel_va = text_va + funcs[FUNC_SELECT_EXP_KEY][0]
     for rel in range(0, len(body) - 12):
         if body[rel] != 0xE8:
             continue
         disp = struct.unpack_from("<i", body, rel + 1)[0]
-        if not (sel_va <= fn_va + rel + 5 + disp < sel_end):
+        if fn_va + rel + 5 + disp != sel_va:
             continue
         window = body[rel + 5:min(len(body), rel + 105)]
         t_idx = window.find(b"\x84\xc0")  # test %al, %al
@@ -728,30 +825,7 @@ def patch_gate4a_user_input_step(data, funcs, text_va, text_off, arch):
 
     found = _x86_step_dispatch(body)
     if found is None:
-        # With mid-stack inlining the compiler can place this function's body
-        # inside one of its siblings, so the symbol's own size does not cover the
-        # dispatch. Widen the search to the other functions of the same receiver
-        # type and accept it only when exactly one of them contains it.
-        prefix = FUNC_MAX_STEP_TOKENS.rsplit(".", 1)[0] + "."
-        owners = []
-        for name, (off, size) in funcs.items():
-            if not name.startswith(prefix) or size == 0:
-                continue
-            candidate = bytes(data[text_off + off:text_off + off + size])
-            if _x86_step_dispatch(candidate) is None:
-                continue
-            owners.append((name, off, size))
-        if len(owners) != 1:
-            raise PatchError(
-                f"{FUNC_MAX_STEP_TOKENS}: x86-64 step-type dispatch not found in the symbol "
-                f"or uniquely among {prefix}* ({len(owners)} candidates)"
-            )
-        _owner_name, fn_entry, fn_size = owners[0]
-        fn_off = text_off + fn_entry
-        fn_va = text_va + fn_entry
-        body = bytes(data[fn_off:fn_off + fn_size])
-        found = _x86_step_dispatch(body)
-        print(f"[i] {FUNC_MAX_STEP_TOKENS}: dispatch inlined into {_owner_name}")
+        raise PatchError(f"{FUNC_MAX_STEP_TOKENS}: x86-64 step-type dispatch not found")
     user_rel, non_user_rel = found
     if not 0 < non_user_rel <= len(body) - 1:
         raise PatchError(f"{FUNC_MAX_STEP_TOKENS}: x86-64 jne target out of range")
