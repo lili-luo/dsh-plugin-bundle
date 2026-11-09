@@ -10,10 +10,62 @@
  * so both can depend on it without a cycle.
  * @module dsh-llm-antigravity-acp/credential
  */
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const WINCRED_EXE = join(__dirname, 'wincred.exe');
+
 /** Prefix `agy` writes in front of the base64 JSON blob stored by `go-keyring`. */
 export const GO_KEYRING_BASE64_PREFIX = 'go-keyring-base64:';
+
+/**
+ * Read the active Windows Credential Manager entry for gemini:antigravity.
+ */
+export function readWinCred(target = 'gemini:antigravity') {
+    if (process.platform !== 'win32' || !existsSync(WINCRED_EXE))
+        return undefined;
+    try {
+        const res = spawnSync(WINCRED_EXE, ['read', target], { encoding: 'utf8', timeout: 5000 });
+        if (res.status === 0 && res.stdout && res.stdout.trim().length > 0)
+            return res.stdout.trim();
+    }
+    catch {}
+    return undefined;
+}
+
+/**
+ * Write a credential payload into Windows Credential Manager.
+ */
+export function writeWinCred(target = 'gemini:antigravity', username = 'antigravity', payload) {
+    if (process.platform !== 'win32' || !existsSync(WINCRED_EXE) || !payload)
+        return false;
+    try {
+        const res = spawnSync(WINCRED_EXE, ['write', target, username], { input: payload, encoding: 'utf8', timeout: 5000 });
+        return res.status === 0;
+    }
+    catch {
+        return false;
+    }
+}
+
+/**
+ * Delete a credential entry from Windows Credential Manager.
+ */
+export function deleteWinCred(target = 'gemini:antigravity') {
+    if (process.platform !== 'win32' || !existsSync(WINCRED_EXE))
+        return false;
+    try {
+        const res = spawnSync(WINCRED_EXE, ['delete', target], { timeout: 5000 });
+        return res.status === 0;
+    }
+    catch {
+        return false;
+    }
+}
+
 /**
  * Unwrap one stored credential blob into its JSON text.
  * Supports `go-keyring-base64:<base64>` (written by `agy` via `go-keyring` on
@@ -34,6 +86,7 @@ export function decodeStoredCredential(raw) {
         return undefined;
     }
 }
+
 /**
  * Unlock the empty-password login keychain of a sandboxed account. macOS
  * resolves the default keychain from `$HOME/Library/Keychains`, so a non-system
@@ -49,6 +102,7 @@ export async function unlockAccountKeychain(layout, run) {
         return;
     await run(['security', 'unlock-keychain', '-p', '', kcPath], 5_000, { HOME: layout.homeDir }).catch(() => undefined);
 }
+
 /**
  * Read one account's raw stored credential: the sandboxed keychain first, the
  * `antigravity-oauth-token` file second. A keychain blob the caller cannot use
@@ -73,13 +127,24 @@ export async function readStoredCredentialRaw(layout, run, platform = process.pl
             return stored.stdout;
     }
     const file = join(layout.appDir, 'antigravity-oauth-token');
-    if (!existsSync(file))
-        return undefined;
-    try {
-        const raw = readFileSync(file, 'utf8');
-        return accept(raw) ? raw : undefined;
+    if (existsSync(file)) {
+        try {
+            const raw = readFileSync(file, 'utf8');
+            if (accept(raw))
+                return raw;
+        }
+        catch {}
     }
-    catch {
-        return undefined;
+    if (platform === 'win32' && layout.system) {
+        const winRaw = readWinCred('gemini:antigravity');
+        if (winRaw && accept(winRaw)) {
+            try {
+                mkdirSync(layout.appDir, { recursive: true });
+                writeFileSync(file, winRaw, 'utf8');
+            }
+            catch {}
+            return winRaw;
+        }
     }
+    return undefined;
 }

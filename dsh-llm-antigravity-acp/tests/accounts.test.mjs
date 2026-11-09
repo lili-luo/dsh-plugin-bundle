@@ -37,17 +37,17 @@ test('buildLayouts puts the machine account first and derives one sandbox per pr
   assert.equal(system.enabled, true)
   assert.equal(system.root, undefined)
   assert.equal(system.geminiDir, '/base')
-  assert.equal(system.appDir, '/base/agy')
-  assert.equal(system.logFile, '/base/acp.log')
+  assert.equal(system.appDir, join('/base', 'agy'))
+  assert.equal(system.logFile, join('/base', 'acp.log'))
   const work = layouts[1]
   assert.equal(work.id, 'work')
   assert.equal(work.label, 'Work')
   assert.equal(work.system, false)
-  assert.equal(work.root, '/base/accounts/work')
-  assert.equal(work.homeDir, '/base/accounts/work/home')
-  assert.equal(work.geminiDir, '/base/accounts/work/gemini')
-  assert.equal(work.appDir, '/base/accounts/work/gemini/agy')
-  assert.equal(work.logFile, '/base/accounts/work/gemini/acp.log')
+  assert.equal(work.root, join('/base', 'accounts', 'work'))
+  assert.equal(work.homeDir, join('/base', 'accounts', 'work', 'home'))
+  assert.equal(work.geminiDir, join('/base', 'accounts', 'work', 'gemini'))
+  assert.equal(work.appDir, join('/base', 'accounts', 'work', 'gemini', 'agy'))
+  assert.equal(work.logFile, join('/base', 'accounts', 'work', 'gemini', 'acp.log'))
   assert.deepEqual(work.env, { HTTPS_PROXY: 'http://127.0.0.1:7890' })
 })
 
@@ -55,7 +55,7 @@ test('buildLayouts honours a declared root and can drop the machine account', ()
   const layouts = buildLayouts({ home: '/base', accounts: [profile('a', { home: '/custom/a', enabled: false })] })
   assert.equal(layouts.length, 1)
   assert.equal(layouts[0].root, '/custom/a')
-  assert.equal(layouts[0].geminiDir, '/custom/a/gemini')
+  assert.equal(layouts[0].geminiDir, join('/custom/a', 'gemini'))
   assert.equal(layouts[0].enabled, false)
 })
 
@@ -69,7 +69,7 @@ test('buildLayouts assigns directory keys when an account only has a remark', ()
     ['acc-1', ''],
     ['acc-3', ''],
   ])
-  assert.equal(layouts[0].root, '/base/accounts/acc-2')
+  assert.equal(layouts[0].root, join('/base', 'accounts', 'acc-2'))
 })
 
 test('buildLayouts leaves a removed account directory in place for the next new account', () => {
@@ -91,18 +91,19 @@ test('buildLayouts rejects malformed and duplicate ids and overlong remarks', ()
 test('accountEnv isolates HOME and never lets a profile override it', () => {
   const [system, work] = buildLayouts({ home: '/base', accounts: [systemAccount(), profile('work', { env: { HOME: '/tmp/evil', HTTPS_PROXY: 'http://p' } })] })
   assert.deepEqual(accountEnv(system, 'darwin'), {})
-  assert.deepEqual(accountEnv(work, 'darwin'), { HOME: '/base/accounts/work/home', HTTPS_PROXY: 'http://p' })
+  assert.deepEqual(accountEnv(work, 'darwin'), { HOME: join('/base', 'accounts', 'work', 'home'), HTTPS_PROXY: 'http://p' })
   const linux = accountEnv(work, 'linux')
-  assert.equal(linux.HOME, '/base/accounts/work/home')
-  assert.equal(linux.DBUS_SESSION_BUS_ADDRESS, 'unix:path=/base/accounts/work/.no-dbus-session')
+  assert.equal(linux.HOME, join('/base', 'accounts', 'work', 'home'))
+  assert.equal(linux.DBUS_SESSION_BUS_ADDRESS, 'unix:path=' + join('/base', 'accounts', 'work', '.no-dbus-session'))
 })
 
 test('loginCommand quotes paths and scopes HOME only for sandboxed accounts', () => {
   const [system, work] = buildLayouts({ home: '/base', accounts: [systemAccount(), profile('work')] })
   assert.equal(loginCommand(system, '/usr/local/bin/agy'), '/usr/local/bin/agy acp --login')
-  assert.equal(loginCommand(work, '/usr/local/bin/agy'), 'HOME=/base/accounts/work/home /usr/local/bin/agy acp --login')
+  const expectedPrefix = /^[A-Za-z0-9_./-]+$/.test(work.homeDir) ? `HOME=${work.homeDir} ` : `HOME='${work.homeDir}' `
+  assert.equal(loginCommand(work, '/usr/local/bin/agy', 'darwin'), `${expectedPrefix}/usr/local/bin/agy acp --login`)
   const spaced = buildLayouts({ home: '/base dir', accounts: [profile('w')] })
-  assert.match(loginCommand(spaced[0], '/opt/my agy/agy'), /^HOME='\/base dir\/accounts\/w\/home' '\/opt\/my agy\/agy' acp --login$/)
+  assert.match(loginCommand(spaced[0], '/opt/my agy/agy', 'darwin'), /^HOME='[/\\]base dir[/\\]accounts[/\\]w[/\\]home' '[/\\]opt[/\\]my agy[/\\]agy' acp --login$/)
 })
 
 test('familyForModel groups models by their quota window', () => {
@@ -315,7 +316,7 @@ test('buildLayouts turns a system entry into this Mac and always enables it', ()
   assert.equal(system.declaredHome, '')
   assert.equal(system.homeDir, homedir())
   assert.equal(system.geminiDir, '/base')
-  assert.equal(system.appDir, '/base/agy')
+  assert.equal(system.appDir, join('/base', 'agy'))
 })
 
 test('buildLayouts defaults an unnamed system entry to the default id and the machine label', () => {
@@ -340,4 +341,22 @@ test('the scheduler no longer filters accounts by model family', () => {
   pool.exhaust('a', 'claude', Date.now() + 60_000)
   assert.equal(pool.choose('claude')?.id, 'b')
   assert.equal(pool.choose('gemini')?.id, 'a')
+})
+
+test('accountEnv and loginCommand on win32', () => {
+  const [system, work] = buildLayouts({ home: '/base', accounts: [systemAccount(), profile('work')] })
+  const winEnv = accountEnv(work, 'win32')
+  assert.equal(winEnv.HOME, join('/base', 'accounts', 'work', 'home'))
+  assert.equal(winEnv.USERPROFILE, join('/base', 'accounts', 'work', 'home'))
+
+  const winCmd = loginCommand(work, 'C:\\tools\\agy.exe', 'win32')
+  assert.match(winCmd, /\$env:USERPROFILE = '.*accounts.*work.*home'; \$env:HOME = '.*accounts.*work.*home'; & 'C:\\tools\\agy.exe' acp --login/)
+})
+
+test('a lower priority number pulls a sticky conversation onto the preferred account', () => {
+  const layouts = buildLayouts({ home: '/base', accounts: [profile('a', { priority: 2 }), profile('b', { priority: 1 })] })
+  const pool = new AccountPool(layouts)
+  assert.equal(pool.choose('gemini', 'a')?.id, 'b')
+  pool.exhaust('b', 'gemini', Date.now() + 60_000)
+  assert.equal(pool.choose('gemini', 'a')?.id, 'a')
 })

@@ -8,7 +8,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
@@ -26,7 +26,7 @@ import {
 import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type AvailableModel, type CatalogModel } from './catalog.ts'
 import { asEffort, current, type AccountProfile, type Config, type Effort } from './config.ts'
 import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedExhaustedError, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type ParkedCall } from './conversation.ts'
-import { unlockAccountKeychain } from './credential.ts'
+import { readWinCred, unlockAccountKeychain, writeWinCred } from './credential.ts'
 import {
   AGENT_TOOL_PREFIX, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
@@ -771,6 +771,15 @@ export class AntigravityRuntime implements AccountAdmin {
 
   private async ensureSlotReady(slot: AccountSlot): Promise<AcpProcess> {
     if (this.disposed) throw new LlmError(labeled('TRANSPORT', 'Antigravity provider was disposed'), 'TRANSPORT')
+    if (process.platform === 'win32') {
+      const tokenFile = join(slot.layout.appDir, 'antigravity-oauth-token')
+      if (existsSync(tokenFile)) {
+        try {
+          const raw = readFileSync(tokenFile, 'utf8')
+          writeWinCred('gemini:antigravity', 'antigravity', raw)
+        } catch {}
+      }
+    }
     if (slot.process?.alive === true) return slot.process
     slot.starting ??= this.startSlot(slot).finally(() => { slot.starting = undefined })
     return slot.starting
@@ -1372,6 +1381,15 @@ export class AntigravityRuntime implements AccountAdmin {
     slot.state = 'starting'
     slot.error = undefined
     try {
+      if (process.platform === 'win32') {
+        const tokenFile = join(slot.layout.appDir, 'antigravity-oauth-token')
+        if (existsSync(tokenFile)) {
+          try {
+            const raw = readFileSync(tokenFile, 'utf8')
+            writeWinCred('gemini:antigravity', 'antigravity', raw)
+          } catch {}
+        }
+      }
       const preflight = await this.runPreflightSlot(slot)
       await this.bridge.start()
       const argv = [
@@ -2103,6 +2121,21 @@ export class AntigravityRuntime implements AccountAdmin {
     const slot = this.slotFor(accountId)
     const binary = this.binary ?? resolveAgyBinary(this.host.config.command)
     this.binary = binary
+    if (process.platform === 'win32') {
+      const sysSlot = this.slots.get('default') ?? Array.from(this.slots.values()).find(s => s.layout.system)
+      if (sysSlot) {
+        const sysTokenFile = join(sysSlot.layout.appDir, 'antigravity-oauth-token')
+        if (!existsSync(sysTokenFile)) {
+          const currentWin = readWinCred('gemini:antigravity')
+          if (currentWin) {
+            try {
+              mkdirSync(sysSlot.layout.appDir, { recursive: true })
+              writeFileSync(sysTokenFile, currentWin, 'utf8')
+            } catch {}
+          }
+        }
+      }
+    }
     await ensureLayout(slot.layout, this.host.runCommand)
     const command = loginCommand(slot.layout, binary)
     this.logins.get(accountId)?.child.terminate()
@@ -2134,6 +2167,16 @@ export class AntigravityRuntime implements AccountAdmin {
     if (outcome === 'timeout') {
       session.child.terminate()
       return { ok: false, email: undefined, error: 'The sign-in did not finish within 120 seconds.' }
+    }
+    if (process.platform === 'win32') {
+      await delay(150)
+      const newCred = readWinCred('gemini:antigravity')
+      if (newCred) {
+        try {
+          mkdirSync(slot.layout.appDir, { recursive: true })
+          writeFileSync(join(slot.layout.appDir, 'antigravity-oauth-token'), newCred, 'utf8')
+        } catch {}
+      }
     }
     let email = await readAccountEmail(slot.layout, this.host.runCommand).catch(() => undefined)
     for (let attempt = 0; email === undefined && outcome.code === 0 && attempt < 3; attempt++) {

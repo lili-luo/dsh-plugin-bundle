@@ -2486,6 +2486,26 @@ window.__ModuleLoader__.load({
       { value: 8, label: t('8x', '8 段') },
     ]
 
+    /** Accounts the user can pin from the menu: enabled ones only. */
+    const pinnableAccounts = (status) => (status && accountsLoaded(status.accounts) ? status.accounts : [])
+      .filter((row) => row !== null && typeof row === 'object' && (row.system === true || row.enabled !== false))
+
+    /** The pinned account id: the single enabled account holding the best priority, or '' for Auto. */
+    const pinnedAccountId = (status) => {
+      const rows = pinnableAccounts(status)
+      const best = Math.min(...rows.map((row) => clampInt(row.priority, 1, 999, 1)))
+      const top = rows.filter((row) => clampInt(row.priority, 1, 999, 1) === best)
+      return rows.length > 1 && top.length === 1 && top.length < rows.length ? top[0].id : ''
+    }
+
+    /** Account list that pins one account (priority 1, others 2); '' restores Auto (all priority 1). */
+    const pinAccountPatch = (status, id) => status.accounts
+      .filter((row) => row !== null && typeof row === 'object')
+      .map((row) => ({
+        ...accountProfileOf(row, Array.isArray(row.visibleModels) ? row.visibleModels.filter((entry) => typeof entry === 'string') : []),
+        priority: id === '' || row.id === id ? 1 : 2,
+      }))
+
     // Live settings last reported by the Host, mirrored into localStorage: the
     // menu rows mount before any round-trip finishes, and a slow or failed
     // status call must not leave the rows blank.
@@ -2659,6 +2679,7 @@ window.__ModuleLoader__.load({
       const rootRef = React.useRef(null)
       const contextButtonRef = React.useRef(null)
       const decodeButtonRef = React.useRef(null)
+      const accountButtonRef = React.useRef(null)
       React.useEffect(() => {
         if (!active) return undefined
         let live = true
@@ -2674,7 +2695,7 @@ window.__ModuleLoader__.load({
       // button via mousedown preventDefault().
       React.useEffect(() => {
         if (openKey === null) return undefined
-        const buttonRefsByKey = { context: contextButtonRef, decode: decodeButtonRef }
+        const buttonRefsByKey = { context: contextButtonRef, decode: decodeButtonRef, account: accountButtonRef }
         const onPointerDown = (e) => {
           const root = rootRef.current
           if (!root) return
@@ -2701,7 +2722,7 @@ window.__ModuleLoader__.load({
         }
       }, [openKey])
       if (!active) return null
-      const buttonRefs = { context: contextButtonRef, decode: decodeButtonRef }
+      const buttonRefs = { context: contextButtonRef, decode: decodeButtonRef, account: accountButtonRef }
       // First Escape collapses the open sub-list (and stops the menu-level
       // handler); a second Escape, with no sub-list open, lets the menu close.
       const onKeyDown = (e) => {
@@ -2724,7 +2745,23 @@ window.__ModuleLoader__.load({
           fail(error instanceof Error ? error.message : String(error))
         }).finally(() => setBusy(false))
       }
+      const pinnable = pinnableAccounts(status)
+      const accountOptions = [
+        { value: '', label: t('Auto', '自动') },
+        ...pinnable.map((row) => ({ value: row.id, label: accountTitle(row) })),
+      ]
       return h('div', { className: 'dsh-agy-list', ref: rootRef, onKeyDown },
+        pinnable.length > 1 ? h(ChoiceRow, {
+          menu: true,
+          label: t('Account', '账号'),
+          options: accountOptions,
+          value: pinnedAccountId(status),
+          disabled: props.locked || busy,
+          open: openKey === 'account',
+          onToggle: (next) => setOpenKey(next ? 'account' : null),
+          buttonRef: accountButtonRef,
+          onChange: (v) => apply({ accounts: pinAccountPatch(status, v) }),
+        }) : null,
         h(ChoiceRow, {
           menu: true,
           label: t('Context', '上下文'),
