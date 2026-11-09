@@ -352,3 +352,11 @@ test('accountEnv and loginCommand on win32', () => {
   const winCmd = loginCommand(work, 'C:\\tools\\agy.exe', 'win32')
   assert.match(winCmd, /\$env:USERPROFILE = '.*accounts.*work.*home'; \$env:HOME = '.*accounts.*work.*home'; & 'C:\\tools\\agy.exe' acp --login/)
 })
+
+test('a lower priority number pulls a sticky conversation onto the preferred account', () => {
+  const layouts = buildLayouts({ home: '/base', accounts: [profile('a', { priority: 2 }), profile('b', { priority: 1 })] })
+  const pool = new AccountPool(layouts)
+  assert.equal(pool.choose('gemini', 'a')?.id, 'b')
+  pool.exhaust('b', 'gemini', Date.now() + 60_000)
+  assert.equal(pool.choose('gemini', 'a')?.id, 'a')
+})
