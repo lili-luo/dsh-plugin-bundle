@@ -363,6 +363,8 @@ export function accountEnv(layout, platform = process.platform) {
         // secret service and falls back to the account's own credential file.
         if (platform === 'linux')
             env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${join(layout.root ?? layout.homeDir, '.no-dbus-session')}`;
+        if (platform === 'win32')
+            env.USERPROFILE = layout.homeDir;
     }
     return env;
 }
@@ -372,7 +374,12 @@ export function accountEnv(layout, platform = process.platform) {
  * @param binary - `agy` executable path.
  * @returns a copy-pasteable command.
  */
-export function loginCommand(layout, binary) {
+export function loginCommand(layout, binary, platform = process.platform) {
+    if (platform === 'win32') {
+        const prefix = layout.system ? '' : `$env:USERPROFILE = ${shellQuote(layout.homeDir)}; $env:HOME = ${shellQuote(layout.homeDir)}; `;
+        const invoke = layout.system ? '' : '& ';
+        return `${prefix}${invoke}${shellQuote(binary)} acp --login`;
+    }
     const prefix = layout.system ? '' : `HOME=${shellQuote(layout.homeDir)} `;
     return `${prefix}${shellQuote(binary)} acp --login`;
 }
@@ -389,6 +396,10 @@ function shellQuote(value) {
 export async function ensureLayout(layout, run, platform = process.platform) {
     mkdirSync(layout.homeDir, { recursive: true });
     prepareHome(layout.geminiDir, layout.homeDir);
+    if (platform === 'win32') {
+        mkdirSync(layout.appDir, { recursive: true });
+        return false;
+    }
     if (layout.system || platform !== 'darwin')
         return false;
     return ensureLoginKeychain(layout, run);

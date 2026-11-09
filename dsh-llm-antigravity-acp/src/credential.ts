@@ -11,12 +11,55 @@
  * @module dsh-llm-antigravity-acp/credential
  */
 
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { spawnSync } from 'node:child_process'
 import type { CommandRunner } from './preflight.ts'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const WINCRED_EXE = join(__dirname, '..', 'lib', 'wincred.exe')
 
 /** Prefix `agy` writes in front of the base64 JSON blob stored by `go-keyring`. */
 export const GO_KEYRING_BASE64_PREFIX = 'go-keyring-base64:'
+
+/**
+ * Read the active Windows Credential Manager entry for gemini:antigravity.
+ */
+export function readWinCred(target = 'gemini:antigravity'): string | undefined {
+  if (process.platform !== 'win32' || !existsSync(WINCRED_EXE)) return undefined
+  try {
+    const res = spawnSync(WINCRED_EXE, ['read', target], { encoding: 'utf8', timeout: 5000 })
+    if (res.status === 0 && res.stdout && res.stdout.trim().length > 0) return res.stdout.trim()
+  } catch {}
+  return undefined
+}
+
+/**
+ * Write a credential payload into Windows Credential Manager.
+ */
+export function writeWinCred(target = 'gemini:antigravity', username = 'antigravity', payload?: string): boolean {
+  if (process.platform !== 'win32' || !existsSync(WINCRED_EXE) || !payload) return false
+  try {
+    const res = spawnSync(WINCRED_EXE, ['write', target, username], { input: payload, encoding: 'utf8', timeout: 5000 })
+    return res.status === 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Delete a credential entry from Windows Credential Manager.
+ */
+export function deleteWinCred(target = 'gemini:antigravity'): boolean {
+  if (process.platform !== 'win32' || !existsSync(WINCRED_EXE)) return false
+  try {
+    const res = spawnSync(WINCRED_EXE, ['delete', target], { timeout: 5000 })
+    return res.status === 0
+  } catch {
+    return false
+  }
+}
 
 /** Layout fields the credential reader needs; structurally satisfied by `AccountLayout`. */
 export interface CredentialLayout {
@@ -88,11 +131,21 @@ export async function readStoredCredentialRaw(
     if (stored.code === 0 && accept(stored.stdout)) return stored.stdout
   }
   const file = join(layout.appDir, 'antigravity-oauth-token')
-  if (!existsSync(file)) return undefined
-  try {
-    const raw = readFileSync(file, 'utf8')
-    return accept(raw) ? raw : undefined
-  } catch {
-    return undefined
+  if (existsSync(file)) {
+    try {
+      const raw = readFileSync(file, 'utf8')
+      if (accept(raw)) return raw
+    } catch {}
   }
+  if (platform === 'win32' && layout.system) {
+    const winRaw = readWinCred('gemini:antigravity')
+    if (winRaw && accept(winRaw)) {
+      try {
+        mkdirSync(layout.appDir, { recursive: true })
+        writeFileSync(file, winRaw, 'utf8')
+      } catch {}
+      return winRaw
+    }
+  }
+  return undefined
 }

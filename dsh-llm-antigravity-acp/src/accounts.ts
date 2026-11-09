@@ -490,6 +490,7 @@ export function accountEnv(layout: AccountLayout, platform: NodeJS.Platform = pr
     // Without a session bus the keyring implementation cannot reach a desktop
     // secret service and falls back to the account's own credential file.
     if (platform === 'linux') env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${join(layout.root ?? layout.homeDir, '.no-dbus-session')}`
+    if (platform === 'win32') env.USERPROFILE = layout.homeDir
   }
   return env
 }
@@ -500,7 +501,12 @@ export function accountEnv(layout: AccountLayout, platform: NodeJS.Platform = pr
  * @param binary - `agy` executable path.
  * @returns a copy-pasteable command.
  */
-export function loginCommand(layout: AccountLayout, binary: string): string {
+export function loginCommand(layout: AccountLayout, binary: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') {
+    const prefix = layout.system ? '' : `$env:USERPROFILE = ${shellQuote(layout.homeDir)}; $env:HOME = ${shellQuote(layout.homeDir)}; `
+    const invoke = layout.system ? '' : '& '
+    return `${prefix}${invoke}${shellQuote(binary)} acp --login`
+  }
   const prefix = layout.system ? '' : `HOME=${shellQuote(layout.homeDir)} `
   return `${prefix}${shellQuote(binary)} acp --login`
 }
@@ -523,6 +529,10 @@ export async function ensureLayout(
 ): Promise<boolean> {
   mkdirSync(layout.homeDir, { recursive: true })
   prepareHome(layout.geminiDir, layout.homeDir)
+  if (platform === 'win32') {
+    mkdirSync(layout.appDir, { recursive: true })
+    return false
+  }
   if (layout.system || platform !== 'darwin') return false
   return ensureLoginKeychain(layout, run)
 }

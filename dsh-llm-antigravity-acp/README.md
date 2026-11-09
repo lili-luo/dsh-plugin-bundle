@@ -48,7 +48,7 @@ flowchart LR
 | 环节 | 做法 |
 |---|---|
 | 为什么不能只换目录 | `agy` 用 `go-keyring` 存登录态，**系统钥匙串优先于目录文件**。只改 `--gemini-dir` 时，子目录里的 token 文件会被钥匙串里的主账号直接盖过 |
-| 凭据隔离 | 每个账号一个独立 `$HOME`。macOS 的 security 框架按 `$HOME/Library/Keychains` 解析默认钥匙串，因此插件在账号沙箱里预建**空密码的独立 `login.keychain-db`**（`security create-keychain` + `set-keychain-settings`，不设自动锁）；`agy` 之后的所有 token 读写与刷新都落在该沙箱内，静默完成、不弹窗。**绝不调用 `security default-keychain -s`**，以免污染本机全局选择 |
+| 凭据隔离 | 每个账号一个独立 `$HOME`。macOS 在沙箱里预建空密码独立 `login.keychain-db`；Linux 通过隔离 D-Bus 引导 `agy` 读写私有 token 文件；Windows 借助内置原生 `wincred.exe` 桥接在 slot 启动/切换及登录时热插拔 Windows 凭据管理器（`gemini:antigravity`），各账号 token 独立持久化，实现全自动无感多账号切换 |
 | 目录布局 | `<插件 home>/accounts/<id>/home`（`$HOME`）、`gemini`（`--gemini-dir`，内含 `agy` 应用数据）、`workspace`（会话 cwd）；ACP 日志写在该账号自己的 `gemini/acp.log` |
 | 登录 | 设置页点「登录」后插件以该账号沙箱启动 `agy acp --login`，把授权 URL 显示在面板里；浏览器授权后把授权码粘回面板即可完成，登录态由 `agy` 自己写入该账号钥匙串。面板同时给出可复制的终端命令作为兜底 |
 | 账号来源 | `accounts` 列表就是账号的唯一来源：列表里带 `system: true` 的条目即「本机」账号（默认 id `default`），直接复用这台机器现有的登录与钥匙串，并始终启用；列表里没有这一条，就表示本机账号已被移除。其余账号同样由 `accounts` 声明 |
@@ -123,7 +123,7 @@ pnpm dsh plugin --profile web add ./plugins/dsh-llm-antigravity-acp
 - ACP 无采样参数通道，`temperature`、`stop`、`maxTokens` 不生效。
 - 逐步精确用量依赖 Node 内置 `node:sqlite` 与 `agy` 本地会话库（`gen_metadata` 表，老版本为 `steps` 表）；若运行环境缺少二者，自动回退为轮末按调用次数归一化的 `TokenUsage`。
 - 隔离目录保留 `manage_task`、`list_resources`、`read_resource` 三个 agy 无副作用工具；其余内置工具不可用，原生权限请求一律拒绝。
-- 多账号的凭据隔离依赖「每个账号一个 `$HOME`」：macOS 已内置空密码钥匙串步骤；Linux 通过断开 D-Bus 会话总线强制走该账号自己的 token 文件；Windows 凭据管理器绑定登录会话，不属于本插件的支持范围。
+- 多账号凭据隔离支持全平台：macOS 通过独立空密码钥匙串；Linux 通过隔离 D-Bus 会话总线；Windows 通过内置原生凭据管理器桥接（`wincred.exe`）支持透明多账号热插拔与独立登录。
 - 每个账号首次都需要一次浏览器授权；插件不会、也不能代替用户完成 Google 登录。
 
 ## 测试

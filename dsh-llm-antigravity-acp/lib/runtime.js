@@ -7,7 +7,7 @@
  * @module dsh-llm-antigravity-acp/runtime
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { LlmError } from '@deepseek-ai/dsh-llm';
 import { AcpProcess } from "./acp-process.js";
@@ -16,7 +16,7 @@ import { AccountPool, accountProfileOf, accountVisibleModels, buildLayouts, ensu
 import { ModelCatalog, intersectVisible, isListedModel, nearestEffort } from "./catalog.js";
 import { asEffort, current } from "./config.js";
 import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedExhaustedError, degradedRouteError, isReanswerFailure, pumpStep, relayNotice } from "./conversation.js";
-import { unlockAccountKeychain } from "./credential.js";
+import { readWinCred, unlockAccountKeychain, writeWinCred } from "./credential.js";
 import { AGENT_TOOL_PREFIX, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES, } from "./history.js";
 import { labeled } from "./labels.js";
 import { JsonRpcClosedError, JsonRpcRemoteError } from "./jsonrpc.js";
@@ -676,8 +676,20 @@ export class AntigravityRuntime {
     async ensureSlotReady(slot) {
         if (this.disposed)
             throw new LlmError(labeled('TRANSPORT', 'Antigravity provider was disposed'), 'TRANSPORT');
-        if (slot.process?.alive === true)
+        if (slot.process?.alive === true) {
+            if (process.platform === 'win32') {
+                const tokenFile = join(slot.layout.appDir, 'antigravity-oauth-token');
+                if (existsSync(tokenFile)) {
+                    try {
+                        const token = readFileSync(tokenFile, 'utf8').trim();
+                        if (token)
+                            writeWinCred('gemini:antigravity', 'antigravity', token);
+                    }
+                    catch {}
+                }
+            }
             return slot.process;
+        }
         slot.starting ??= this.startSlot(slot).finally(() => { slot.starting = undefined; });
         return slot.starting;
     }
@@ -1253,6 +1265,27 @@ export class AntigravityRuntime {
         try {
             const preflight = await this.runPreflightSlot(slot);
             await this.bridge.start();
+            if (process.platform === 'win32') {
+                const tokenFile = join(slot.layout.appDir, 'antigravity-oauth-token');
+                if (existsSync(tokenFile)) {
+                    try {
+                        const token = readFileSync(tokenFile, 'utf8').trim();
+                        if (token)
+                            writeWinCred('gemini:antigravity', 'antigravity', token);
+                    }
+                    catch {}
+                }
+                else if (slot.layout.system) {
+                    const currentWin = readWinCred('gemini:antigravity');
+                    if (currentWin) {
+                        try {
+                            mkdirSync(slot.layout.appDir, { recursive: true });
+                            writeFileSync(tokenFile, currentWin, 'utf8');
+                        }
+                        catch {}
+                    }
+                }
+            }
             const argv = [
                 preflight.binary, 'acp',
                 '--gemini-dir', preflight.home,
@@ -1985,6 +2018,22 @@ export class AntigravityRuntime {
         const binary = this.binary ?? resolveAgyBinary(this.host.config.command);
         this.binary = binary;
         await ensureLayout(slot.layout, this.host.runCommand);
+        if (process.platform === 'win32') {
+            const sysSlot = this.slots.get(SYSTEM_ACCOUNT_ID) ?? [...this.slots.values()].find(s => s.layout.system);
+            if (sysSlot) {
+                const sysTokenFile = join(sysSlot.layout.appDir, 'antigravity-oauth-token');
+                if (!existsSync(sysTokenFile)) {
+                    const currentWin = readWinCred('gemini:antigravity');
+                    if (currentWin) {
+                        try {
+                            mkdirSync(sysSlot.layout.appDir, { recursive: true });
+                            writeFileSync(sysTokenFile, currentWin, 'utf8');
+                        }
+                        catch {}
+                    }
+                }
+            }
+        }
         const command = loginCommand(slot.layout, binary);
         this.logins.get(accountId)?.child.terminate();
         this.logins.delete(accountId);
@@ -2017,6 +2066,17 @@ export class AntigravityRuntime {
         if (outcome === 'timeout') {
             session.child.terminate();
             return { ok: false, email: undefined, error: 'The sign-in did not finish within 120 seconds.' };
+        }
+        if (process.platform === 'win32') {
+            await delay(150);
+            const newCred = readWinCred('gemini:antigravity');
+            if (newCred) {
+                try {
+                    mkdirSync(slot.layout.appDir, { recursive: true });
+                    writeFileSync(join(slot.layout.appDir, 'antigravity-oauth-token'), newCred, 'utf8');
+                }
+                catch {}
+            }
         }
         let email = await readAccountEmail(slot.layout, this.host.runCommand).catch(() => undefined);
         for (let attempt = 0; email === undefined && outcome.code === 0 && attempt < 3; attempt++) {
