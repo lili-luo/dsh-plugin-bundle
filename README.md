@@ -2,7 +2,7 @@
 
 基于 DeepSeek Harness（DSH）的插件组合包。每个目录可以用 `path:` 单独安装。
 
-本仓库和 LINUX DO 上的介绍帖已经公开，Google 已经识别到 Antigravity 这套接入方式，并开始从提示词上做缓解。封号已经出现。请谨慎使用：目前付费套餐暂时还没有封号，活动、赠送一类套餐封号比较集中。细节见 [dsh-llm-antigravity-acp](./dsh-llm-antigravity-acp)。
+本仓库和 LINUX DO 上的介绍帖已经公开。Google 会用提示词做检测，插件这边已经用提示词处理做了缓解。封号已经出现。请谨慎使用：目前付费套餐暂时还没有封号，活动、赠送一类套餐封号比较集中。细节见 [dsh-llm-antigravity-acp](./dsh-llm-antigravity-acp)。
 
 | 目录 | 内容 |
 |---|---|
