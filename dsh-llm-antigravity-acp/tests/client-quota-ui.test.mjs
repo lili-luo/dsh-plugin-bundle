@@ -269,6 +269,11 @@ function loadClientPlugin({ language = 'zh-CN', remoteService, sessions, uiWorks
             title: props.title,
           }, props.children)
         },
+        // The real primitive clones its anchor and portals a bubble; the
+        // settings tests only need the label to travel with the anchor.
+        Tooltip(props) {
+          return React.createElement('span', { 'data-tooltip': props.label }, props.children)
+        },
       }
     }
     throw new Error(`Unexpected require(${pkg})`)
@@ -812,9 +817,11 @@ test('SettingsCard renders live settings as value rows that apply the chosen opt
   ])
   assert.equal(rows.every((row) => row.props.disabled === false), true)
   const hint = (row) => findOne(row, (node) => node.props && node.props.className === 'dsh-agy-hint')
-  assert.match(hint(rows[2]).props.title, /自动接着写/)
-  assert.match(hint(rows[3]).props.title, /128K截断重答/)
-  assert.match(hint(rows[4]).props.title, /谁来读文件/)
+  const hintText = (row) => findOne(row, (node) => node.props && node.props['data-tooltip'] !== undefined).props['data-tooltip']
+  assert.ok(hint(rows[2]), 'the label carries the hint glyph')
+  assert.match(hintText(rows[2]), /自动接着写/)
+  assert.match(hintText(rows[3]), /128K截断重答/)
+  assert.match(hintText(rows[4]), /谁来读文件/)
 
   // The row opens the choice list inline; the current value carries the check.
   rows[0].props.onClick()

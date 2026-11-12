@@ -615,7 +615,7 @@ window.__ModuleLoader__.load({
     const t = (en, cn) => (isZh() ? cn : en)
 
     // Shared selection UI (bundle-concatenated ahead of this file by the build).
-    const { Modal, Button } = require('@deepseek-ai/dsh-client-ui-primitives')
+    const { Modal, Button, Tooltip } = require('@deepseek-ai/dsh-client-ui-primitives')
     const MS = createModelSelection({ React, h, t, Modal, Button })
 
     /** Provider-level allowlist adapter: reads/writes `visibleModels`. */
@@ -935,7 +935,11 @@ window.__ModuleLoader__.load({
       '.dsh-agy-row[aria-expanded="true"]{background:color-mix(in srgb, currentColor 4%, transparent)}',
       '@media(hover:hover){button.dsh-agy-row:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}}',
       '.dsh-agy-label{flex:0 0 auto;display:inline-flex;align-items:center;white-space:nowrap;color:var(--dsw-alias-label-primary);font-weight:500}',
-      '.dsh-agy-hint{display:inline-flex;align-items:center;margin-left:6px;color:var(--dsw-alias-label-tertiary);cursor:help}',
+      // An 18px hit box around the 13px glyph: a 13px icon is hard to land on,
+      // and the negative margins keep the row's label baseline unmoved.
+      '.dsh-agy-hint{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;width:18px;height:18px;margin:-2px -3px -2px 3px;border-radius:4px;color:var(--dsw-alias-label-tertiary);cursor:help}',
+      '.dsh-agy-hint>svg{display:block}',
+      '@media(hover:hover){.dsh-agy-hint:hover{background:var(--dsw-alias-interactive-bg-hover,color-mix(in srgb,currentColor 6%,transparent));color:var(--dsw-alias-label-secondary)}}',
       '.dsh-agy-value{flex:1 1 auto;min-width:0;text-align:right;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
       '.dsh-agy-row[data-interactive="true"] .dsh-agy-value{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.dsh-agy-chevron{flex:0 0 auto;width:12px;height:12px;color:var(--dsw-alias-menu-icon);transition:transform 120ms ease}',
@@ -1128,14 +1132,33 @@ window.__ModuleLoader__.load({
       'stroke-linecap': 'round', 'stroke-linejoin': 'round',
     }))
 
-    /** A glyph mark. The explanation lives on `title`, so row text stays the label and value. */
-    const Hint = (props) => h('span', { className: 'dsh-agy-hint', title: props.text, 'aria-label': props.text },
-      h('svg', { viewBox: '0 0 16 16', width: 13, height: 13, fill: 'none', 'aria-hidden': 'true' },
+    /**
+     * A glyph mark whose explanation opens in DSH's tooltip bubble, so row text
+     * stays the label and value. A native `title` cannot carry this: the desktop
+     * shell is Electron on macOS, where Chromium's title tooltips are unreliable
+     * (often never painted), so hovering the mark showed nothing at all.
+     */
+    const Hint = (props) => {
+      const glyph = h('svg', { viewBox: '0 0 16 16', width: 13, height: 13, fill: 'none', 'aria-hidden': 'true' },
         h('circle', { cx: 8, cy: 8, r: 6.25, stroke: 'currentColor', 'stroke-width': 1.2 }),
         h('path', {
           d: 'M8 11.3v.15M6.55 6.35a1.45 1.45 0 1 1 2.15 1.25c-.45.3-.7.6-.7 1.15V9.1',
           stroke: 'currentColor', 'stroke-width': 1.2, 'stroke-linecap': 'round',
-        })))
+        }))
+      // The mark sits inside the row's button: clicking it pins the explanation
+      // instead of expanding the choice list underneath it.
+      const mark = h('span', { className: 'dsh-agy-hint', onClick: (event) => { event.stopPropagation() } }, glyph)
+      // Older primitives without Tooltip keep a native title as the fallback.
+      if (Tooltip === undefined) return h('span', { className: 'dsh-agy-hint', title: props.text }, glyph)
+      return h(Tooltip, {
+        label: props.text,
+        side: 'top',
+        delayMs: 120,
+        portal: true,
+        maxWidth: 340,
+        openOnClick: true,
+      }, mark)
+    }
 
     /**
      * One setting as a row: label on the left, the current value and a chevron
@@ -1165,6 +1188,9 @@ window.__ModuleLoader__.load({
           ...(menu ? { role: 'menuitem' } : {}),
           'aria-expanded': isOpen,
           'aria-label': `${props.label} ${current ? current.label : ''}`.trim(),
+          // The hover bubble is not reachable from the keyboard, so the row
+          // itself carries the same explanation as its accessible description.
+          'aria-description': props.hint || undefined,
           disabled: props.disabled,
           'data-interactive': 'true',
           className: 'dsh-agy-row',
@@ -2822,8 +2848,8 @@ window.__ModuleLoader__.load({
             h(ChoiceRow, {
               label: t('Degraded route', '降智处理'),
               hint: t(
-                'What happens when an answer looks off. 128K re-asks only when the request was cut at 128K and the rest was not seen; other signs are only marked. Full re-asks whenever it looks downgraded. Monitor keeps the answer and only marks it.',
-                '发现这次回答不正常时怎么处理。128K截断重答：只有内容被砍到前 128K、后面没被看到时才重答，其他异常只提示。全量降智拦截重答：只要像被降智了就丢掉重答。仅监测提示：回答照常显示，只在胶囊上做记号。',
+                'What happens when an answer looks off.\n128K re-asks: only when the request was cut at 128K and the rest was not seen; other signs are only marked.\nFull re-asks: whenever it looks downgraded.\nMonitor: keeps the answer and only marks it.',
+                '发现这次回答不正常时怎么处理。\n128K截断重答：只有内容被砍到前 128K、后面没被看到时才重答，其他异常只提示。\n全量降智拦截重答：只要像被降智了就丢掉重答。\n仅监测提示：回答照常显示，只在胶囊上做记号。',
               ),
               options: degradeOptions(),
               value: status.degradeAction || 'truncation',
@@ -2835,8 +2861,8 @@ window.__ModuleLoader__.load({
             h(ChoiceRow, {
               label: t('Engine mode', '引擎模式'),
               hint: t(
-                'Who reads files, edits them, and runs commands. Bridge: the model thinks and DSH does that work. Native: Antigravity’s own tools do that work, while subagents, skills, and todos stay with DSH.',
-                '谁来读文件、改文件、跑命令。DSH 工具桥接：模型只负责想，这些活由 DSH 来做。原生 Agent（满血）：这些活由 Antigravity 自己的工具来做，子代理、技能、待办仍由 DSH 提供。',
+                'Who reads files, edits them, and runs commands.\nBridge: the model thinks and DSH does that work.\nNative: Antigravity’s own tools do that work, while subagents, skills, and todos stay with DSH.',
+                '谁来读文件、改文件、跑命令。\nDSH 工具桥接：模型只负责想，这些活由 DSH 来做。\n原生 Agent（满血）：这些活由 Antigravity 自己的工具来做，子代理、技能、待办仍由 DSH 提供。',
               ),
               options: engineOptions(),
               value: status.engineMode || 'bridge',
