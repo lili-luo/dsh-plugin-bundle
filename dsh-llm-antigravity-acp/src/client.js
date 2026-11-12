@@ -336,7 +336,8 @@ window.__ModuleLoader__.load({
       'button.dsh-agy-row:focus-visible{background:var(--dsw-alias-interactive-bg-hover)}',
       '.dsh-agy-row[aria-expanded="true"]{background:color-mix(in srgb, currentColor 4%, transparent)}',
       '@media(hover:hover){button.dsh-agy-row:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}}',
-      '.dsh-agy-label{flex:0 0 auto;white-space:nowrap;color:var(--dsw-alias-label-primary);font-weight:500}',
+      '.dsh-agy-label{flex:0 0 auto;display:inline-flex;align-items:center;white-space:nowrap;color:var(--dsw-alias-label-primary);font-weight:500}',
+      '.dsh-agy-hint{display:inline-flex;align-items:center;margin-left:6px;color:var(--dsw-alias-label-tertiary);cursor:help}',
       '.dsh-agy-value{flex:1 1 auto;min-width:0;text-align:right;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}',
       '.dsh-agy-row[data-interactive="true"] .dsh-agy-value{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
       '.dsh-agy-chevron{flex:0 0 auto;width:12px;height:12px;color:var(--dsw-alias-menu-icon);transition:transform 120ms ease}',
@@ -447,10 +448,11 @@ window.__ModuleLoader__.load({
       '.dsh-agy-ticket-row > .dsh-agy-ticket-link,.dsh-agy-ticket-row > .dsh-agy-ticket-command{flex:1 1 auto;min-width:0}',
       '.dsh-agy-ticket-link{color:var(--dsw-alias-label-link, #2f6feb);font-size:13px;overflow-wrap:anywhere}',
       '.dsh-agy-ticket-command{font-size:12px;opacity:0.9;white-space:pre-wrap;overflow-wrap:anywhere;padding:6px 8px;background:color-mix(in srgb, currentColor 10%, transparent);border-radius:6px}',
-      // A quiet icon action: invisible chrome at rest, a real target on hover,
-      // and a success tick that replaces the glyph instead of resizing the row.
-      '.dsh-agy-copy{box-sizing:border-box;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;margin-top:-2px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary, color-mix(in srgb, currentColor 62%, transparent));cursor:pointer;outline:none;transition:background 120ms ease,color 120ms ease}',
-      '@media(hover:hover){.dsh-agy-copy:hover{background:var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));color:var(--dsw-alias-label-primary)}}',
+      // A quiet icon action that still reads as a target: the same hairline
+      // border as the panel's other buttons, no fill until hover, and a
+      // success tick that replaces the glyph instead of resizing the row.
+      '.dsh-agy-copy{box-sizing:border-box;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;margin-top:-2px;padding:0;border:0.5px solid var(--dsw-alias-border-l3, color-mix(in srgb, currentColor 16%, transparent));border-radius:6px;background:transparent;color:var(--dsw-alias-label-secondary, var(--dsw-alias-label-tertiary, currentColor));cursor:pointer;outline:none;transition:background 120ms ease,color 120ms ease,border-color 120ms ease}',
+      '@media(hover:hover){.dsh-agy-copy:hover{background:var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));border-color:var(--dsw-alias-border-l4, color-mix(in srgb, currentColor 24%, transparent));color:var(--dsw-alias-label-primary)}}',
       '.dsh-agy-copy:focus-visible{box-shadow:0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary, #4176e6))}',
       '.dsh-agy-copy[data-copied="true"]{color:var(--dsw-alias-state-success-primary, #2e9e6a)}',
       '.dsh-agy-copy .dsh-agy-check{width:14px;height:14px}',
@@ -528,6 +530,15 @@ window.__ModuleLoader__.load({
       'stroke-linecap': 'round', 'stroke-linejoin': 'round',
     }))
 
+    /** A glyph mark. The explanation lives on `title`, so row text stays the label and value. */
+    const Hint = (props) => h('span', { className: 'dsh-agy-hint', title: props.text, 'aria-label': props.text },
+      h('svg', { viewBox: '0 0 16 16', width: 13, height: 13, fill: 'none', 'aria-hidden': 'true' },
+        h('circle', { cx: 8, cy: 8, r: 6.25, stroke: 'currentColor', 'stroke-width': 1.2 }),
+        h('path', {
+          d: 'M8 11.3v.15M6.55 6.35a1.45 1.45 0 1 1 2.15 1.25c-.45.3-.7.6-.7 1.15V9.1',
+          stroke: 'currentColor', 'stroke-width': 1.2, 'stroke-linecap': 'round',
+        })))
+
     /**
      * One setting as a row: label on the left, the current value and a chevron
      * on the right, and the available values as a check-marked list that opens
@@ -561,7 +572,7 @@ window.__ModuleLoader__.load({
           className: 'dsh-agy-row',
           onClick: () => { if (!props.disabled) toggle(!isOpen) },
         },
-          h('span', { className: 'dsh-agy-label' }, props.label),
+          h('span', { className: 'dsh-agy-label' }, props.label, props.hint ? h(Hint, { text: props.hint }) : null),
           h('span', { className: 'dsh-agy-value' }, current ? current.label : '—'),
           chevron(isOpen)),
         isOpen ? h('div', { className: 'dsh-agy-options' },
@@ -2199,6 +2210,10 @@ window.__ModuleLoader__.load({
             }),
             h(ChoiceRow, {
               label: t('Long decode', '超长续写'),
+              hint: t(
+                'When one reply hits the length limit before it is finished, this is how many times it continues on its own. Off stops there.',
+                '一次写到长度上限、没写完时，自动接着写的段数。选「关闭」就写满停下。',
+              ),
               options: decodeOptions(),
               value: status.longDecodeContinuations ?? 3,
               disabled: busy,
@@ -2208,6 +2223,10 @@ window.__ModuleLoader__.load({
             }),
             h(ChoiceRow, {
               label: t('Degraded route', '降智处理'),
+              hint: t(
+                'What happens when an answer looks off. 128K re-asks only when the request was cut at 128K and the rest was not seen; other signs are only marked. Full re-asks whenever it looks downgraded. Monitor keeps the answer and only marks it.',
+                '发现这次回答不正常时怎么处理。128K截断重答：只有内容被砍到前 128K、后面没被看到时才重答，其他异常只提示。全量降智拦截重答：只要像被降智了就丢掉重答。仅监测提示：回答照常显示，只在胶囊上做记号。',
+              ),
               options: degradeOptions(),
               value: status.degradeAction || 'truncation',
               disabled: busy,
@@ -2217,6 +2236,10 @@ window.__ModuleLoader__.load({
             }),
             h(ChoiceRow, {
               label: t('Engine mode', '引擎模式'),
+              hint: t(
+                'Who reads files, edits them, and runs commands. Bridge: the model thinks and DSH does that work. Native: Antigravity’s own tools do that work, while subagents, skills, and todos stay with DSH.',
+                '谁来读文件、改文件、跑命令。DSH 工具桥接：模型只负责想，这些活由 DSH 来做。原生 Agent（满血）：这些活由 Antigravity 自己的工具来做，子代理、技能、待办仍由 DSH 提供。',
+              ),
               options: engineOptions(),
               value: status.engineMode || 'bridge',
               disabled: busy,

@@ -811,6 +811,10 @@ test('SettingsCard renders live settings as value rows that apply the chosen opt
     '引擎模式DSH 工具桥接',
   ])
   assert.equal(rows.every((row) => row.props.disabled === false), true)
+  const hint = (row) => findOne(row, (node) => node.props && node.props.className === 'dsh-agy-hint')
+  assert.match(hint(rows[2]).props.title, /自动接着写/)
+  assert.match(hint(rows[3]).props.title, /128K截断重答/)
+  assert.match(hint(rows[4]).props.title, /谁来读文件/)
 
   // The row opens the choice list inline; the current value carries the check.
   rows[0].props.onClick()
