@@ -2,6 +2,8 @@
 
 基于 DeepSeek Harness（DSH）的插件组合包。每个目录可以用 `path:` 单独安装。
 
+本仓库和 LINUX DO 上的介绍帖已经公开，Google 已经识别到 Antigravity 这套接入方式，并开始从提示词上做缓解。封号已经出现。请谨慎使用：目前付费套餐暂时还没有封号，活动、赠送一类套餐封号比较集中。细节见 [dsh-llm-antigravity-acp](./dsh-llm-antigravity-acp)。
+
 | 目录 | 内容 |
 |---|---|
 | [`dsh-llm-antigravity-acp`](./dsh-llm-antigravity-acp) | 用本机官方 `agy acp` 把 Antigravity 接成 DSH 一级模型。登录态留在官方进程里，插件不保存钥匙，也不把请求转到别的网关。 |
