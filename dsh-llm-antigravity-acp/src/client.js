@@ -441,8 +441,19 @@ window.__ModuleLoader__.load({
       '.dsh-agy-account-error{font-size:12px;color:#d9534f;padding:6px 10px;background:color-mix(in srgb, #d9534f 10%, transparent);border-radius:8px}',
       '.dsh-agy-error-text{color:#d9534f;font-size:12px;white-space:normal}',
       '.dsh-agy-ticket{display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:12px;background:color-mix(in srgb, currentColor 5%, transparent);border:0.5px solid var(--dsw-alias-settings-card-stroke, color-mix(in srgb, currentColor 12%, transparent))}',
+      // One copyable line: the wrapped text keeps every remaining pixel and the
+      // copy control keeps its own, so neither squeezes the other at any width.
+      '.dsh-agy-ticket-row{display:flex;align-items:flex-start;gap:6px;min-width:0}',
+      '.dsh-agy-ticket-row > .dsh-agy-ticket-link,.dsh-agy-ticket-row > .dsh-agy-ticket-command{flex:1 1 auto;min-width:0}',
       '.dsh-agy-ticket-link{color:var(--dsw-alias-label-link, #2f6feb);font-size:13px;overflow-wrap:anywhere}',
       '.dsh-agy-ticket-command{font-size:12px;opacity:0.9;white-space:pre-wrap;overflow-wrap:anywhere;padding:6px 8px;background:color-mix(in srgb, currentColor 10%, transparent);border-radius:6px}',
+      // A quiet icon action: invisible chrome at rest, a real target on hover,
+      // and a success tick that replaces the glyph instead of resizing the row.
+      '.dsh-agy-copy{box-sizing:border-box;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;margin-top:-2px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary, color-mix(in srgb, currentColor 62%, transparent));cursor:pointer;outline:none;transition:background 120ms ease,color 120ms ease}',
+      '@media(hover:hover){.dsh-agy-copy:hover{background:var(--dsw-alias-interactive-bg-hover, color-mix(in srgb, currentColor 8%, transparent));color:var(--dsw-alias-label-primary)}}',
+      '.dsh-agy-copy:focus-visible{box-shadow:0 0 0 2px var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary, #4176e6))}',
+      '.dsh-agy-copy[data-copied="true"]{color:var(--dsw-alias-state-success-primary, #2e9e6a)}',
+      '.dsh-agy-copy .dsh-agy-check{width:14px;height:14px}',
       '.dsh-agy-quota-loading{font-size:12px;opacity:0.68;padding:2px 4px}',
       '.dsh-agy-quota-error{font-size:12px;color:#d9534f;padding:2px 4px}',
       // Chips stack inside a row: tighter than the wrapping badge stack.
@@ -687,6 +698,85 @@ window.__ModuleLoader__.load({
       }, props.children)
     }
 
+    /**
+     * Place text on the host clipboard. The async Clipboard API is preferred —
+     * it needs the click's user activation, which the copy control keeps.
+     * jsdom, insecure origins, and older hosts omit it, so a hidden textarea
+     * plus `execCommand('copy')` stays as the documented fallback.
+     */
+    async function copyText(text) {
+      const value = String(text ?? '')
+      try {
+        if (typeof navigator !== 'undefined' && navigator.clipboard !== null
+          && typeof navigator.clipboard === 'object' && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(value)
+          return true
+        }
+      } catch { /* an explicit denial falls through to the fallback path */ }
+      try {
+        if (typeof document === 'undefined' || typeof document.createElement !== 'function'
+          || document.body === null || document.body === undefined) return false
+        const area = document.createElement('textarea')
+        area.value = value
+        area.setAttribute('readonly', '')
+        area.style.position = 'fixed'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.select()
+        const ok = typeof document.execCommand === 'function' && document.execCommand('copy') === true
+        area.remove()
+        return ok
+      } catch { return false }
+    }
+
+    /** Two offset rounded squares: the platform-neutral "copy" glyph. */
+    const copyIcon = () => h('svg', {
+      viewBox: '0 0 24 24', width: 14, height: 14, fill: 'none',
+      'aria-hidden': 'true', style: { flexShrink: 0 },
+    }, h('path', {
+      d: 'M9.5 9.5h7a1.5 1.5 0 0 1 1.5 1.5v7a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 8 18v-7a1.5 1.5 0 0 1 1.5-1.5zM5 15h-.5A1.5 1.5 0 0 1 3 13.5v-7A1.5 1.5 0 0 1 4.5 5h7A1.5 1.5 0 0 1 13 6.5V7',
+      stroke: 'currentColor', 'stroke-width': 1.7,
+      'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+    }))
+
+    /**
+     * One clipboard action for a read-only line of the sign-in hand-off. The
+     * success tick lives inside this control, so copying never re-renders the
+     * card around it and the tick can never land on the wrong row.
+     */
+    function CopyButton(props) {
+      const [copied, setCopied] = React.useState(false)
+      const timer = React.useRef(null)
+      React.useEffect(() => () => {
+        if (timer.current !== null) {
+          clearTimeout(timer.current)
+          timer.current = null
+        }
+      }, [])
+      const label = copied ? t('Copied', '已复制') : props.label
+      const onCopy = () => {
+        if (copied) return
+        void copyText(props.text).then((ok) => {
+          if (!ok) return
+          setCopied(true)
+          if (timer.current !== null) clearTimeout(timer.current)
+          timer.current = setTimeout(() => {
+            timer.current = null
+            setCopied(false)
+          }, 1400)
+        })
+      }
+      return h('button', {
+        type: 'button',
+        className: 'dsh-agy-copy',
+        'data-agy-copy': props.kind,
+        'data-copied': copied ? 'true' : undefined,
+        title: label,
+        'aria-label': label,
+        onClick: onCopy,
+      }, copied ? checkMark() : copyIcon())
+    }
+
     // ── Account helpers shared by the panel, its cards, and its dialog ──────────
 
     /** Remark exactly as the Host stores it: trimmed, empty when absent. */
@@ -751,6 +841,7 @@ window.__ModuleLoader__.load({
       if (raw === 'Gemini Models' || raw === 'Gemini') return t('Gemini quota', 'Gemini 额度')
       if (raw === 'Claude and GPT models' || raw === 'Claude') return t('Claude quota', 'Claude 额度')
       if (group && group.kind === 'argon') return t('Gemini 4 Argon (weekly)', 'Gemini 4 Argon（独立周限）')
+      if (raw === 'Gemini 4 Carbon / Argon' || raw === 'Gemini 4 Carbon / Argon / 3.8') return t('Gemini / Carbon / Argon quota', 'Gemini / Carbon / Argon 额度')
       if (raw === 'Gemini 4 Argon / 3.8') return t('Gemini / Argon quota', 'Gemini / Argon 额度')
       if (raw === 'Gemini 3.8 Flash') return t('Gemini 3.8 quota', 'Gemini 3.8 额度')
       return t(`${raw} quota`, `${raw} 额度`)
@@ -919,15 +1010,29 @@ window.__ModuleLoader__.load({
             t(`${accountFamilyLabel(entry.family)} paused ${cooldownLabel(entry.until)}`, `${accountFamilyLabel(entry.family)} 冷却 ${cooldownLabel(entry.until)}`)))) : null,
         row.error ? h('div', { role: 'alert', className: 'dsh-agy-account-error' }, row.error) : null,
         // Inline sign-in hand-off: authorization link, terminal fallback, and
-        // an equal-height code field + primary submit + cancel cluster.
+        // an equal-height code field + primary submit + cancel cluster. Both
+        // read-only lines carry their own copy action — each one is a wall of
+        // wrapped text that no one should have to drag-select.
         ticket ? h('div', { className: 'dsh-agy-ticket' },
-          h('a', {
-            href: ticket.url,
-            target: '_blank',
-            rel: 'noreferrer',
-            className: 'dsh-agy-ticket-link',
-          }, ticket.url),
-          h('code', { className: 'dsh-agy-ticket-command' }, ticket.command),
+          ticket.url ? h('div', { className: 'dsh-agy-ticket-row', 'data-agy-ticket': 'link' },
+            h('a', {
+              href: ticket.url,
+              target: '_blank',
+              rel: 'noreferrer',
+              className: 'dsh-agy-ticket-link',
+            }, ticket.url),
+            h(CopyButton, {
+              kind: 'link',
+              text: ticket.url,
+              label: t('Copy sign-in link', '复制授权链接'),
+            })) : null,
+          ticket.command ? h('div', { className: 'dsh-agy-ticket-row', 'data-agy-ticket': 'command' },
+            h('code', { className: 'dsh-agy-ticket-command' }, ticket.command),
+            h(CopyButton, {
+              kind: 'command',
+              text: ticket.command,
+              label: t('Copy terminal command', '复制终端命令'),
+            })) : null,
           h('div', { className: 'dsh-agy-inline-row-wrap' },
             h('input', {
               type: 'text',
@@ -1615,11 +1720,12 @@ window.__ModuleLoader__.load({
       }, [open])
 
       if (!active) return null
-      const isArgon = /argon/i.test(String((selection && selection.model) || ''))
+      // Route health covers both Gemini 4 flagship families (Argon and Carbon).
+      const isFlagship = /argon|carbon/i.test(String((selection && selection.model) || ''))
       const healthMap = runtimeStatus && runtimeStatus.sessionHealth && typeof runtimeStatus.sessionHealth === 'object'
         ? runtimeStatus.sessionHealth
         : null
-      const sessionHealth = isArgon && props.sessionId && healthMap ? healthMap[props.sessionId] || null : null
+      const sessionHealth = isFlagship && props.sessionId && healthMap ? healthMap[props.sessionId] || null : null
       const isDegraded = !!(sessionHealth && sessionHealth.degraded === true)
       const interceptedCount = sessionHealth && Number(sessionHealth.interceptedSteps) > 0
         ? Number(sessionHealth.interceptedSteps)
@@ -1881,6 +1987,19 @@ window.__ModuleLoader__.load({
       { value: 256000, label: '256K' },
     ]
 
+    /** Route-health intervention levels for Gemini 4 Argon / Carbon steps the fingerprint flags. */
+    const degradeOptions = () => [
+      { value: 'truncation', label: t('Re-answer on 128K truncation', '128K截断重答') },
+      { value: 'legacy', label: t('Re-answer on any flag', '全量降智拦截重答') },
+      { value: 'observe', label: t('Observe only', '仅监测提示') },
+    ]
+
+    /** ACP agent engine modes: DSH tool bridge vs native Antigravity agent with non-overlapping MCP tools. */
+    const engineOptions = () => [
+      { value: 'bridge', label: t('DSH tool bridge', 'DSH 工具桥接') },
+      { value: 'native', label: t('Native agent (full strength)', '原生 Agent（满血）') },
+    ]
+
     /** Long-decode choices: Antigravity's control over how far one reply may run. */
     const decodeOptions = () => [
       { value: 0, label: t('Off', '关闭') },
@@ -2086,6 +2205,24 @@ window.__ModuleLoader__.load({
               open: openKey === 'decode',
               onToggle: (next) => setOpenKey(next ? 'decode' : null),
               onChange: (v) => void applyPatch({ longDecodeContinuations: v }),
+            }),
+            h(ChoiceRow, {
+              label: t('Degraded route', '降智处理'),
+              options: degradeOptions(),
+              value: status.degradeAction || 'truncation',
+              disabled: busy,
+              open: openKey === 'degrade',
+              onToggle: (next) => setOpenKey(next ? 'degrade' : null),
+              onChange: (v) => void applyPatch({ degradeAction: v }),
+            }),
+            h(ChoiceRow, {
+              label: t('Engine mode', '引擎模式'),
+              options: engineOptions(),
+              value: status.engineMode || 'bridge',
+              disabled: busy,
+              open: openKey === 'engine',
+              onToggle: (next) => setOpenKey(next ? 'engine' : null),
+              onChange: (v) => void applyPatch({ engineMode: v }),
             }))
             : null,
           status ? h(DisplayAliases, { status, client: props.client, onStatus: adoptStatus }) : null,

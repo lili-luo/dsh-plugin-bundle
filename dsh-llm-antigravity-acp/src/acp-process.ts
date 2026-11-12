@@ -31,14 +31,23 @@ export interface AcpSessionListener {
   onPermission?(request: AcpPermissionRequest): AcpPermissionOutcome | undefined
 }
 
+/** File or resource location reported on an ACP tool call. */
+export interface AcpToolLocation {
+  path?: string
+  [key: string]: unknown
+}
+
 /** One `session/update` payload. */
 export interface AcpSessionUpdate {
   sessionUpdate: string
   content?: { type: string; text?: string }
   toolCallId?: string
+  name?: string
   title?: string
   status?: string
   kind?: string
+  locations?: AcpToolLocation[]
+  rawInput?: unknown
   mcpServerName?: string
   mcpToolName?: string
   _meta?: AcpToolCallMeta
@@ -56,6 +65,7 @@ export interface AcpToolCallMeta {
   mcpToolName?: string
   toolName?: string
   tool?: string
+  name?: string
   [key: string]: unknown
 }
 
@@ -74,8 +84,10 @@ export interface AcpPermissionRequest {
   sessionId: string
   toolCall?: {
     toolCallId?: string
+    name?: string
     title?: string
     kind?: string
+    locations?: AcpToolLocation[]
     rawInput?: unknown
     mcpServerName?: string
     mcpToolName?: string

@@ -40,7 +40,10 @@ function makeRuntime({ config: configExtra = {}, host = {}, plan, env: envExtra 
     accounts: [{ id: 'default', displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [], priority: 1, weight: 1 }],
     contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(home, 'missing.py'),
     maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
-    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, ...configExtra,
+    // These tests pin the re-answer machinery itself, so they opt into the
+    // intervention level that refuses on any degraded verdict; the default
+    // level is pinned in degrade-policy.test.mjs.
+    longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000, degradeAction: 'legacy', ...configExtra,
   }
   const runtime = new AntigravityRuntime({
     config,
@@ -283,53 +286,95 @@ test('C4b a degraded gate after a completed tool step re-answers without replayi
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1, 'the tool-result retry opens no session/new')
 })
 
-test('C5 after two automatic re-answers a degraded text answer is delivered and the session is marked degraded', { timeout: 90_000 }, async () => {
+test('C5 after four automatic re-answers a degraded text answer is delivered and the session is marked degraded', { timeout: 120_000 }, async () => {
   const { adapter, prompts, runtime } = makeRuntime({
     plan: [
       { gen: DEGRADED_NO_THOUGHT, text: '第一次降智回答。' },
       { gen: DEGRADED_NO_THOUGHT, text: '第二次降智回答。' },
-      { gen: DEGRADED_NO_THOUGHT, text: '第三次降智仍然要交出的回答。' },
+      { gen: DEGRADED_NO_THOUGHT, text: '第三次降智回答。' },
+      { gen: DEGRADED_NO_THOUGHT, text: '第四次降智回答。' },
+      { gen: DEGRADED_NO_THOUGHT, text: '第五次降智仍然要交出的回答。' },
     ],
   })
   const messages = [sys, user('u1', 'fix the quota display')]
   const attempt = () => adapter.stream(argonStep(messages, { sessionId: 'C5', tools: [bash] }))
 
-  const first = await failedStep(attempt())
-  assert.ok(first.error !== undefined, 'the first degraded attempt fails the step')
-  assert.equal(first.error.code, 'DEGRADED_ROUTE')
-  const second = await failedStep(attempt())
-  assert.ok(second.error !== undefined, 'the second degraded attempt fails the step too')
-  assert.equal(second.error.code, 'DEGRADED_ROUTE')
+  for (const [index, attemptResult] of [await failedStep(attempt()), await failedStep(attempt()), await failedStep(attempt()), await failedStep(attempt())].entries()) {
+    assert.ok(attemptResult.error !== undefined, `degraded attempt ${index + 1} fails the step so the harness keeps retrying`)
+    assert.equal(attemptResult.error.code, 'DEGRADED_ROUTE', `attempt ${index + 1} spends one of the four re-answer grants`)
+  }
 
-  const third = await collect(attempt())
-  assert.equal(finishOf(third).reason.kind, 'stop', 'the third attempt is delivered instead of retried again')
-  assert.equal(textOf(third), '第三次降智仍然要交出的回答。', 'the exhausted re-answer reaches the transcript')
-  assert.equal(prompts().length, 3, 'one prompt per attempt is all the plugin sends')
+  const fifth = await collect(attempt())
+  assert.equal(finishOf(fifth).reason.kind, 'stop', 'the fifth attempt is delivered instead of retried again')
+  assert.equal(textOf(fifth), '第五次降智仍然要交出的回答。', 'the exhausted re-answer reaches the transcript')
+  assert.equal(prompts().length, 5, 'one prompt per attempt is all the plugin sends')
   assert.equal(runtime.sessionHealthFor('C5')?.degraded, true, 'the session reports its degraded health')
 })
 
-test('C5 a degraded tool gate that survives two re-answers fails with DEGRADED_ROUTE_EXHAUSTED', { timeout: 90_000 }, async () => {
-  const { adapter, prompts } = makeRuntime({
+test('C5 a degraded tool gate that survives four re-answers hands the tool call to the harness instead of killing the task', { timeout: 120_000 }, async () => {
+  const { adapter, prompts, runtime } = makeRuntime({
     plan: [
-      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'rm -rf /tmp/wrong' } }, text: '' },
-      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'rm -rf /tmp/wrong' } }, text: '' },
-      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'rm -rf /tmp/wrong' } }, text: '' },
+      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'ls /tmp/one' } }, text: '' },
+      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'ls /tmp/two' } }, text: '' },
+      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'ls /tmp/three' } }, text: '' },
+      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'ls /tmp/four' } }, text: '' },
+      { gen: DEGRADED_TOOL, tool: { name: 'bash', args: { command: 'ls /tmp/five' } }, text: '' },
     ],
   })
   const messages = [sys, user('u1', 'clean the workspace')]
   const attempt = () => adapter.stream(argonStep(messages, { sessionId: 'C5t', tools: [bash] }))
 
-  const first = await failedStep(attempt())
-  assert.equal(first.error?.code, 'DEGRADED_ROUTE', 'the first gate degrade asks for a re-answer')
-  const second = await failedStep(attempt())
-  assert.equal(second.error?.code, 'DEGRADED_ROUTE', 'the second gate degrade asks for one more re-answer')
+  for (const [index, attemptResult] of [await failedStep(attempt()), await failedStep(attempt()), await failedStep(attempt()), await failedStep(attempt())].entries()) {
+    assert.equal(attemptResult.error?.code, 'DEGRADED_ROUTE', `gate degrade ${index + 1} asks for another re-answer`)
+    assert.deepEqual(callsOf(attemptResult.chunks), [], `refused attempt ${index + 1} never reaches the harness`)
+  }
 
-  const third = await failedStep(attempt())
-  assert.ok(third.error !== undefined, 'the exhausted gate fails the step')
-  assert.equal(third.error.code, 'DEGRADED_ROUTE_EXHAUSTED', 'an unverified tool call is never handed to the harness')
-  assert.ok(third.error.message.startsWith('[降智未恢复]'), `the message states the abort: ${third.error.message}`)
-  assert.deepEqual(callsOf(third.chunks), [], 'no tool call reached the harness')
-  assert.equal(prompts().length, 3, 'the plugin stops asking after two re-answers')
+  const fifth = await failedStep(attempt())
+  assert.equal(fifth.error, undefined, `the exhausted gate no longer fails the step: ${fifth.error?.message}`)
+  assert.equal(finishOf(fifth.chunks).reason.kind, 'tool-calls', 'the fifth attempt ends on its tool call')
+  const calls = callsOf(fifth.chunks)
+  assert.equal(calls.length, 1, 'the tool call reaches the harness, which applies its own permissions')
+  assert.equal(calls[0].name, 'bash')
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'ls /tmp/five' }, 'the delivered call is the latest attempt, not a stale refused one')
+  assert.equal(prompts().length, 5, 'the plugin stops asking after four re-answers')
+  assert.equal(runtime.sessionHealthFor('C5t')?.degraded, true, 'the session still reports its degraded health')
+})
+
+test('C8 a warm session whose reroll already failed once escapes into a fresh session with a full history replay', { timeout: 90_000 }, async () => {
+  const { adapter, prompts, lifecycle } = makeRuntime({
+    plan: [
+      { gen: HEALTHY_TEXT, thought: 'Warming the session.', text: 'Warm round one.' },
+      { gen: DEGRADED_NO_THOUGHT, text: '第一次降智回答。' },
+      { gen: DEGRADED_NO_THOUGHT, text: '第二次降智回答。' },
+      { gen: HEALTHY_TEXT, thought: 'Re-reading the whole replayed conversation.', text: 'Escaped into a healthy route.' },
+    ],
+  })
+  const firstMessages = [sys, user('u1', 'warm the session')]
+  const warm = await collect(adapter.stream(argonStep(firstMessages, { sessionId: 'C8', tools: [bash] })))
+  assert.equal(finishOf(warm).reason.kind, 'stop', 'the warm-up round completes')
+
+  const messages = [...firstMessages, assistantFrom('a1', warm), user('u2', 'fix the quota display')]
+  const attempt = () => adapter.stream(argonStep(messages, { sessionId: 'C8', tools: [bash] }))
+  const first = await failedStep(attempt())
+  assert.equal(first.error?.code, 'DEGRADED_ROUTE', 'the first degraded answer rerolls in place')
+  const second = await failedStep(attempt())
+  assert.equal(second.error?.code, 'DEGRADED_ROUTE', 'the in-place reroll degrades too')
+
+  const third = await collect(attempt())
+  assert.equal(finishOf(third).reason.kind, 'stop')
+  assert.equal(textOf(third), 'Escaped into a healthy route.')
+
+  const turns = prompts()
+  assert.equal(turns.length, 4, 'one prompt per attempt')
+  assert.equal(turns[1].session, turns[0].session, 'the first reroll stays in the warm session')
+  assert.ok(turns[2].text.includes(NOTICE), `the first reroll is a continuation notice: ${turns[2].text}`)
+  assert.notEqual(turns[3].session, turns[1].session, 'the second reroll replaces the poisoned session')
+  assert.match(turns[3].text, HISTORY, 'the replacement session receives a history replay')
+  assert.ok(turns[3].text.includes('warm the session'), `the replay carries the first round: ${turns[3].text}`)
+  assert.ok(turns[3].text.includes('fix the quota display'), 'the replay also carries the live request')
+  assert.ok(!turns[3].text.includes(NOTICE), 'the escaped reroll is never a bare continuation notice')
+  assert.ok(turns[3].system.includes('[reanswer:'), `the replayed system carries the reanswer tag: ${turns[3].system}`)
+  assert.equal(lifecycle().filter(e => e.op === 'new').length, 2, 'exactly one replacement session/new is opened')
 })
 
 test('C6 a new user message after a failed attempt is sent incrementally instead of as a re-answer', { timeout: 60_000 }, async () => {

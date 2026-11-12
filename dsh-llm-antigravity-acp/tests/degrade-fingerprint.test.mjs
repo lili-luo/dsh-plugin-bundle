@@ -1,7 +1,9 @@
 // Unit tests for the shadow-degradation fingerprint verdict on real `gen_metadata` replays.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { evaluateDegradeFingerprint } from '../lib/usage-db.js'
+import { RouteHealth } from '../lib/route-health.js'
+import { slotDisablesModel } from '../lib/slots.js'
+import { evaluateDegradeFingerprint, isGemini4Flagship } from '../lib/usage-db.js'
 
 // Replayed steps of one real ACP session (effort=high, model=gemini-4-argon). The 2048-token
 // block-quantized cache hit stays constant at 18432 across the tail of the session, so every
@@ -122,4 +124,62 @@ test('a cold-start first step with no cache read and a fast decode degrades on i
   assert.equal(cold.degraded, true)
   assert.equal(cold.score, 3)
   assert.equal(cold.signals.find(signal => signal.kind === 'fast_decode').points, 3)
+})
+
+test('Gemini 4 Carbon is judged by the same fingerprint as Argon', () => {
+  assert.equal(isGemini4Flagship('gemini-4-carbon'), true)
+  assert.equal(isGemini4Flagship('Gemini 4 Carbon (High)'), true)
+  assert.equal(isGemini4Flagship('gemini-4-argon-high'), true)
+  assert.equal(isGemini4Flagship('gemini-3.8-flash'), false)
+  assert.equal(isGemini4Flagship('claude-opus-5-5'), false)
+
+  const step = {
+    inputTokens: 3069, cachedReadTokens: 124928, outputTokens: 90, thoughtTokens: 15,
+    textOutTokens: 75, ttftSeconds: 3.1, streamSeconds: 0.4, wallSeconds: 3.5,
+  }
+  const carbon = evaluateDegradeFingerprint({ model: 'gemini-4-carbon', effort: 'high', cwmEstTokens: 378_421, step })
+  const argon = evaluateDegradeFingerprint({ model: 'gemini-4-argon', effort: 'high', cwmEstTokens: 378_421, step })
+  assert.equal(carbon.evaluated, true)
+  assert.equal(carbon.degraded, true)
+  assert.deepEqual(carbon.signals, argon.signals, 'Carbon and Argon produce identical verdicts')
+  assert.equal(carbon.score, argon.score)
+
+  const flash = evaluateDegradeFingerprint({ model: 'gemini-3.8-flash', effort: 'high', cwmEstTokens: 378_421, step })
+  assert.equal(flash.evaluated, false, 'non-flagship families are never judged')
+})
+
+test('a Carbon route-health verdict survives the end of its turn', () => {
+  const health = new RouteHealth(true)
+  health.beginTurn()
+  health.observeEvaluatedStep({
+    model: 'gemini-4-carbon',
+    effort: 'high',
+    step: {
+      inputTokens: 3069, cachedReadTokens: 124928, outputTokens: 90, thoughtTokens: 15,
+      textOutTokens: 75, ttftSeconds: 3.1, streamSeconds: 0.4, wallSeconds: 3.5,
+    },
+    cwmEstTokens: 378_421,
+    isToolStep: false,
+    recordUninterceptedHit: true,
+  })
+  health.finalizeTurnHealth('gemini-4-carbon')
+  const snapshot = health.snapshot()
+  assert.equal(snapshot?.degraded, true, 'finalizeTurnHealth keeps the Carbon verdict instead of clearing it')
+  assert.equal(snapshot?.model, 'gemini-4-carbon')
+  assert.equal(health.consecutiveDegradedTurns, 1)
+
+  health.beginTurn()
+  health.finalizeTurnHealth('gemini-3.8-flash')
+  assert.equal(health.snapshot(), undefined, 'a non-flagship turn clears the live state')
+})
+
+test('slotDisablesModel covers every Carbon and Argon variant through its family entry', () => {
+  const slot = { disabledModels: ['gemini-4-carbon'] }
+  assert.equal(slotDisablesModel(slot, 'gemini-4-carbon'), true)
+  assert.equal(slotDisablesModel(slot, 'gemini-4-carbon-high'), true)
+  assert.equal(slotDisablesModel(slot, 'gemini-4-argon'), false, 'a disabled Carbon leaves Argon alone')
+  assert.equal(slotDisablesModel({ disabledModels: ['gemini-4-carbon-disabled'] }, 'gemini-4-carbon'), true)
+  assert.equal(slotDisablesModel({ disabledModels: ['gemini-4-argon'] }, 'gemini-4-carbon'), false)
+  assert.equal(slotDisablesModel({ disabledModels: ['gemini-4-argon'] }, 'gemini-4-argon-low'), true)
+  assert.equal(slotDisablesModel({ disabledModels: undefined }, 'gemini-4-carbon'), false)
 })

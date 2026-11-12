@@ -10,7 +10,7 @@
  */
 import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
 /** Agent id installed in the isolated home. */
 export const BRIDGE_AGENT = 'dsh-bridge';
 /** Minimum official CLI version supporting `agy acp --process-per-session`. */
@@ -181,7 +181,8 @@ export function syncOAuthToken(home, userHome = homedir()) {
     }
 }
 /**
- * Write the isolated Antigravity home: bridge agent and ACP settings.
+ * Write the isolated Antigravity home: bridge agent, ACP settings, the default
+ * CLI project record, and completed onboarding state.
  * @param home - absolute home directory used as `--gemini-dir`.
  * @param userHome - optional user home override for file-backed token sync.
  * @returns the empty workspace directory used as every session's cwd.
@@ -193,11 +194,15 @@ export function prepareHome(home, userHome = homedir()) {
     writeIfChanged(join(agentDir, `${BRIDGE_AGENT}.md`), [
         '---',
         `name: ${BRIDGE_AGENT}`,
-        'description: "DeepSeek Harness primary-model bridge: no built-in tools, harness tools only"',
+        'description: "Primary-model bridge: no built-in tools, harness tools only"',
         'tools: []',
         'excludeDefaultComponents: true',
         'mainAgent: true',
         '---',
+        '<identity>',
+        'You are Antigravity, a powerful agentic AI coding assistant designed by the Google DeepMind team working on Advanced Agentic Coding.',
+        'You are an interactive CLI tool that helps users with software engineering tasks.',
+        '</identity>',
         'Follow the appended system instructions exactly. Act only through the harness tools you are given.',
         '',
     ].join('\n'));
@@ -205,17 +210,79 @@ export function prepareHome(home, userHome = homedir()) {
     mkdirSync(join(appData, 'conversations'), { recursive: true });
     mkdirSync(join(home, 'antigravity', 'conversations'), { recursive: true });
     syncOAuthToken(home, userHome);
-    seedCliSettingsFile(join(appData, 'settings.json'));
+    const hostUseAiCredits = readHostUseAiCredits(userHome);
+    seedHostAiCreditsConfig(join(home, 'config', 'config.json'), hostUseAiCredits);
+    seedCliSettingsFile(join(appData, 'settings.json'), userHome, hostUseAiCredits);
     const defaultCliAppData = join(home, 'antigravity-cli');
     mkdirSync(defaultCliAppData, { recursive: true });
-    seedCliSettingsFile(join(defaultCliAppData, 'settings.json'));
+    seedCliSettingsFile(join(defaultCliAppData, 'settings.json'), userHome, hostUseAiCredits);
+    seedDefaultCliProject(join(home, 'config', 'projects', `${DEFAULT_CLI_PROJECT_ID}.json`));
+    seedOnboardingFile(join(appData, 'cache', 'onboarding.json'));
+    seedOnboardingFile(join(defaultCliAppData, 'cache', 'onboarding.json'));
     const workspace = join(home, 'workspace');
     mkdirSync(workspace, { recursive: true });
     return workspace;
 }
-function seedCliSettingsFile(settingsPath) {
+/** Project id `agy` resolves for every CLI conversation that names no project. */
+export const DEFAULT_CLI_PROJECT_ID = 'default-cli-project';
+/** Onboarding state seeded into both isolated app-data directories. */
+export const SEEDED_ONBOARDING = { consumerOnboardingComplete: true, enterpriseOnboardingComplete: false, onboardingComplete: true };
+/**
+ * Seed the default CLI project record that `agy` reads on every step; a missing
+ * file logs `project_store_get_file_missing`. A valid record already on disk is
+ * kept, because `agy` owns its `projectResources`.
+ */
+function seedDefaultCliProject(projectPath) {
+    if (readJson(projectPath).id === DEFAULT_CLI_PROJECT_ID)
+        return;
+    mkdirSync(dirname(projectPath), { recursive: true });
+    writeFileSync(projectPath, `${JSON.stringify({ id: DEFAULT_CLI_PROJECT_ID, name: 'CLI Project', projectResources: {} }, null, 2)}\n`);
+}
+/** Mark onboarding complete so the isolated CLI never waits on its interactive onboarding flow. */
+function seedOnboardingFile(onboardingPath) {
+    const existing = readJson(onboardingPath);
+    if (existing.consumerOnboardingComplete === true && existing.onboardingComplete === true)
+        return;
+    mkdirSync(dirname(onboardingPath), { recursive: true });
+    writeFileSync(onboardingPath, `${JSON.stringify({
+        ...existing,
+        consumerOnboardingComplete: true,
+        enterpriseOnboardingComplete: typeof existing.enterpriseOnboardingComplete === 'boolean'
+            ? existing.enterpriseOnboardingComplete
+            : SEEDED_ONBOARDING.enterpriseOnboardingComplete,
+        onboardingComplete: true,
+    })}\n`);
+}
+function readHostUseAiCredits(userHome) {
+    const hostConfig = readJson(join(userHome, '.gemini', 'config', 'config.json'));
+    const userSettings = hostConfig.userSettings;
+    if (userSettings !== null && typeof userSettings === 'object' && !Array.isArray(userSettings)) {
+        const flag = userSettings.useAiCredits;
+        if (typeof flag === 'boolean')
+            return flag;
+    }
+    return undefined;
+}
+function seedHostAiCreditsConfig(configPath, useAiCredits) {
+    if (useAiCredits === undefined)
+        return;
+    const existing = readJson(configPath);
+    const rawSettings = existing.userSettings;
+    const existingSettings = rawSettings !== null && typeof rawSettings === 'object' && !Array.isArray(rawSettings)
+        ? rawSettings
+        : {};
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeIfChanged(configPath, `${JSON.stringify({
+        ...existing,
+        userSettings: {
+            ...existingSettings,
+            useAiCredits,
+        },
+    }, null, 2)}\n`);
+}
+function seedCliSettingsFile(settingsPath, userHome = homedir(), hostUseAiCredits) {
     const settings = readJson(settingsPath);
-    const hostCliSettings = readJson(join(homedir(), '.gemini', 'antigravity-cli', 'settings.json'));
+    const hostCliSettings = readJson(join(userHome, '.gemini', 'antigravity-cli', 'settings.json'));
     const rawModel = typeof settings.model === 'string' ? settings.model.trim() : '';
     const model = rawModel.length > 0 && rawModel !== 'Gemini 4 Argon (Medium)'
         ? rawModel
@@ -225,7 +292,9 @@ function seedCliSettingsFile(settingsPath) {
         : DEFAULT_SEEDED_CONTEXT_WINDOW;
     const useG1Credits = typeof settings.useG1Credits === 'boolean'
         ? settings.useG1Credits
-        : (typeof hostCliSettings.useG1Credits === 'boolean' ? hostCliSettings.useG1Credits : undefined);
+        : typeof hostCliSettings.useG1Credits === 'boolean'
+            ? hostCliSettings.useG1Credits
+            : hostUseAiCredits;
     writeIfChanged(settingsPath, `${JSON.stringify({
         ...settings,
         ...(useG1Credits !== undefined ? { useG1Credits } : {}),

@@ -196,3 +196,39 @@ test('remote.configure persists nothing when the request touches no account', as
   assert.equal(writes[0].accounts, undefined)
   assert.equal(writes[0].contextWindow, 900_000)
 })
+
+test('a configure request carries a live degradeAction and rejects unknown levels', () => {
+  for (const level of ['observe', 'truncation', 'legacy']) {
+    assert.equal(parseConfigureRequest({ degradeAction: level }).degradeAction, level)
+  }
+  assert.equal(Object.hasOwn(parseConfigureRequest({ contextWindow: 0 }), 'degradeAction'), false, 'an omitted level stays untouched')
+  assert.throws(() => parseConfigureRequest({ degradeAction: 'aggressive' }), /Invalid antigravity degradeAction/)
+  assert.throws(() => parseConfigureRequest({ degradeAction: 1 }), /Invalid antigravity degradeAction/)
+})
+
+test('remote.configure applies and persists degradeAction without touching the account list', async () => {
+  const { remote, patches, writes } = mountRemote([machineRow()])
+  await remote.configure({ degradeAction: 'observe' })
+  assert.deepEqual(patches, [{ degradeAction: 'observe' }])
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].degradeAction, 'observe')
+  assert.equal(writes[0].accounts, undefined)
+})
+
+test('a configure request carries a live engineMode and rejects unknown modes', () => {
+  for (const mode of ['bridge', 'native']) {
+    assert.equal(parseConfigureRequest({ engineMode: mode }).engineMode, mode)
+  }
+  assert.equal(Object.hasOwn(parseConfigureRequest({ contextWindow: 0 }), 'engineMode'), false)
+  assert.throws(() => parseConfigureRequest({ engineMode: 'hybrid' }), /Invalid antigravity engineMode/)
+  assert.throws(() => parseConfigureRequest({ engineMode: true }), /Invalid antigravity engineMode/)
+})
+
+test('remote.configure applies and persists engineMode without touching the account list', async () => {
+  const { remote, patches, writes } = mountRemote([machineRow()])
+  await remote.configure({ engineMode: 'native' })
+  assert.deepEqual(patches, [{ engineMode: 'native' }])
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].engineMode, 'native')
+  assert.equal(writes[0].accounts, undefined)
+})

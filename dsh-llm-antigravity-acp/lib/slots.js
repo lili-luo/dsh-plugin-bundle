@@ -20,6 +20,8 @@ export function newSlot(layout) {
         preflightPromise: undefined,
         process: undefined,
         starting: undefined,
+        engineMode: undefined,
+        frontCwd: undefined,
         state: 'idle',
         error: undefined,
         readyAt: 0,
@@ -49,15 +51,17 @@ export function rebaseSlot(slot, layout) {
     return envChanged;
 }
 /**
- * Whether upstream marked one model disabled on an account. Argon is listed by
- * family name (`gemini-4-argon`), so one Argon entry covers every Argon variant
- * of that account.
+ * Whether upstream marked one model disabled on an account. Argon and Carbon
+ * are listed by family name (`gemini-4-argon`, `gemini-4-carbon`), so one
+ * family entry covers every variant of that family on the account.
  * @param slot - account slot.
  * @param model - model asked about.
  * @returns true when the account's own report disables the model.
  */
 export function slotDisablesModel(slot, model) {
-    return slot.disabledModels?.some(entry => entry === model || (/argon/i.test(entry) && /argon/i.test(model))) === true;
+    return slot.disabledModels?.some(entry => entry === model
+        || (/argon/i.test(entry) && /argon/i.test(model))
+        || (/carbon/i.test(entry) && /carbon/i.test(model))) === true;
 }
 /**
  * Whether one account's own report rules out a model: upstream marked it

@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import { AntigravityRuntime, compactBridgeTool, DEFAULT_RELAY_AFTER_MS, MAX_EAGER_BRIDGE_TOOL_BYTES } from '../lib/runtime.js'
+import { acpClientVersion, AntigravityRuntime, compactBridgeTool, DEFAULT_RELAY_AFTER_MS, MAX_EAGER_BRIDGE_TOOL_BYTES } from '../lib/runtime.js'
 import { AntigravityAdapter } from '../lib/adapter.js'
 import { Config } from '../lib/config.js'
 import { classifyAgentNotice, toTokenUsage } from '../lib/conversation.js'
@@ -94,7 +94,8 @@ test('single turn streams reasoning, text, exact usage, and the selected model a
   assert.match(textOf(chunks), /^echo:gemini-3\.8-flash:low:/)
   const usage = chunks.find(c => c.type === 'usage').usage
   assert.deepEqual(usage, { inputTokens: 600, outputTokens: 50, cacheReadTokens: 400, reasoningTokens: 20, totalTokens: 1050 })
-  assert.match(prompts()[0].system, /primary model of a DeepSeek Harness/)
+  assert.match(prompts()[0].system.replaceAll('\u200b', ''), /primary model of this coding session/)
+  assert.doesNotMatch(prompts()[0].system, /DeepSeek Harness/)
 })
 
 test('resolveModel declares the context window, three efforts, and in-history system updates', async () => {
@@ -106,7 +107,7 @@ test('resolveModel declares the context window, three efforts, and in-history sy
   assert.equal(info.reasoning.defaultEffort, 'medium')
   assert.equal(info.systemPromptUpdate, 'in-history')
   const listed = await adapter.listModels('antigravity')
-  assert.deepEqual(listed.map(m => m.id), ['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium'])
+  assert.deepEqual(listed.map(m => m.id), ['gemini-4-carbon', 'gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium'])
 })
 
 test('a tool call parks, ends the step, and resumes the same ACP turn with the DSH result', async () => {
@@ -510,16 +511,28 @@ test('live configure updates context window, default effort, and long-decode con
   assert.equal(info.context.contextWindow, 900_000)
   assert.equal(info.reasoning.defaultEffort, 'low')
 })
-test('the ACP client identity is on the third-party-model allowlist', async () => {
-  const { adapter, inits } = makeRuntime()
+test('the ACP client identifies as the official Antigravity client with the agy semver', async () => {
+  const argvLog = join(mkdtempSync(join(tmpdir(), 'agy-argv-')), 'argv.jsonl')
+  const { adapter, inits } = makeRuntime({ env: { FAKE_AGY_ARGV: argvLog } })
   await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S13', messages: [sys, user('u1', 'hello')] }))
-  assert.equal(inits()[0].clientInfo.name, 'jetbrains.dsh')
+  assert.deepEqual(inits()[0].clientInfo, { name: 'antigravity', version: '0.0.1' })
+  const argv = JSON.parse(readFileSync(argvLog, 'utf8').trim().split('\n')[0])
+  const flag = argv.indexOf('--override_user_agent_name')
+  assert.ok(flag > 0, `agy acp argv carries the user-agent override: ${JSON.stringify(argv)}`)
+  assert.equal(argv[flag + 1], 'antigravity')
+  assert.equal(argv[0], 'acp')
+})
+
+test('acpClientVersion keeps the agy semver and falls back to 1.5.5', () => {
+  assert.equal(acpClientVersion('Antigravity CLI 1.5.7'), '1.5.7')
+  assert.equal(acpClientVersion('v1.6.0-beta.2'), '1.6.0')
+  assert.equal(acpClientVersion('unknown'), '1.5.5')
 })
 
 test('every endpoint-advertised family including Sonnet and GPT-OSS appears in the picker and resolves cleanly', async () => {
   const { adapter } = makeRuntime()
   const listed = (await adapter.listModels('antigravity')).map(m => m.id)
-  assert.deepEqual(listed, ['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium'])
+  assert.deepEqual(listed, ['gemini-4-carbon', 'gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium'])
   const claude = await adapter.resolveModel('antigravity', 'claude-opus-5-5')
   assert.deepEqual(claude.reasoning.efforts.map(e => e.id), ['low', 'medium', 'high'])
   assert.equal(claude.context.contextWindow, 256_000)
@@ -1139,6 +1152,32 @@ test('prepareHome pre-seeds Gemini 4 Argon (High) in settings.json without overw
   assert.equal(JSON.parse(readFileSync(customCliSettings, 'utf8')).useG1Credits, true)
 })
 
+test('prepareHome seeds the default CLI project and completed onboarding without clobbering agy-owned state', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agy-preflight-seed-'))
+  prepareHome(dir)
+  const projectPath = join(dir, 'config', 'projects', 'default-cli-project.json')
+  assert.deepEqual(JSON.parse(readFileSync(projectPath, 'utf8')), { id: 'default-cli-project', name: 'CLI Project', projectResources: {} })
+  const expectedOnboarding = '{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}\n'
+  for (const appData of ['agy', 'antigravity-cli']) {
+    assert.equal(readFileSync(join(dir, appData, 'cache', 'onboarding.json'), 'utf8'), expectedOnboarding, `${appData} onboarding`)
+  }
+
+  // agy owns projectResources once it writes them; a valid record is kept as is.
+  const owned = { id: 'default-cli-project', name: 'CLI Project', projectResources: { repo: { path: '/w' } } }
+  writeFileSync(projectPath, JSON.stringify(owned))
+  // A pretty-printed incomplete onboarding written by agy is completed in place, extra keys kept.
+  const cliOnboarding = join(dir, 'antigravity-cli', 'cache', 'onboarding.json')
+  writeFileSync(cliOnboarding, JSON.stringify({ consumerOnboardingComplete: false, enterpriseOnboardingComplete: true, onboardingComplete: false, seenAt: 7 }, null, 2))
+  prepareHome(dir)
+  assert.deepEqual(JSON.parse(readFileSync(projectPath, 'utf8')), owned)
+  assert.deepEqual(JSON.parse(readFileSync(cliOnboarding, 'utf8')), { consumerOnboardingComplete: true, enterpriseOnboardingComplete: true, onboardingComplete: true, seenAt: 7 })
+
+  // A corrupt project record is replaced.
+  writeFileSync(projectPath, '{not json')
+  prepareHome(dir)
+  assert.equal(JSON.parse(readFileSync(projectPath, 'utf8')).id, 'default-cli-project')
+})
+
 test('evaluateDegradeFingerprint decodes real-time gen_metadata billing and catches 128K truncation without compaction false positives', () => {
   const tmpDb = join(mkdtempSync(join(tmpdir(), 'agy-fp-')), 'conv.db')
   writeRichModelStep(tmpDb, 0, {
@@ -1339,8 +1378,9 @@ test('prompt hierarchy lifts AGENTS.md into <user_rules>, preserves oversized to
   assert.equal(finishOf(turn1).reason.kind, 'stop')
 
   const p1 = prompts()[0]
-  assert.match(p1.system, /<user_rules>\nMANDATORY_REPO_RULE: preserve trailing newlines\.\n<\/user_rules>/)
-  assert.match(p1.system, /<harness_tool_contracts>[\s\S]*CRITICAL_DELEGATION_RULE: never poll in a loop after spawning\./)
+  const plainSystem = p1.system.replaceAll('\u200b', '')
+  assert.match(plainSystem, /<user_rules>\nMANDATORY_REPO_RULE: preserve trailing newlines\.\n<\/user_rules>/)
+  assert.match(plainSystem, /<harness_tool_contracts>[\s\S]*CRITICAL_DELEGATION_RULE: never poll in a loop after spawning\./)
   assert.doesNotMatch(p1.text, /MANDATORY_REPO_RULE/, 'lifted initial agent-instructions are not duplicated in user input')
   assert.equal(p1.text, '<system-reminder>Available skills: dsh-code-review</system-reminder>\n\nPlease review runtime.ts')
 

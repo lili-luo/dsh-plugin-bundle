@@ -1,6 +1,6 @@
 /**
  * Route health of one conversation: the shadow-degradation fingerprint that
- * decides whether a degraded Argon answer is refused and re-asked, the per-turn
+ * decides whether a degraded Gemini 4 flagship (Argon or Carbon) answer is refused and re-asked, the per-turn
  * marks it accumulates, and the numbers the quota pill reads. Everything lives
  * in one object so a reset is a single replacement instead of a field-by-field
  * sweep.
@@ -9,7 +9,7 @@
 
 import type { Effort } from './config.ts'
 import {
-  evaluateDegradeFingerprint,
+  evaluateDegradeFingerprint, isGemini4Flagship,
   type DegradeFingerprintInput, type DegradeFingerprintResult, type DegradeSignal,
   type GenUsageBatch, type StepUsageBatch,
 } from './usage-db.ts'
@@ -193,7 +193,7 @@ export class RouteHealth {
    */
   finalizeTurnHealth(model: string): void {
     if (!this.main) return
-    if (!/argon/i.test(model)) {
+    if (!isGemini4Flagship(model)) {
       this.degradeState = undefined
       return
     }
@@ -206,6 +206,19 @@ export class RouteHealth {
     this.consecutiveDegradedTurns = 0
     if (this.turnSawExactPrefixCache) this.hasHealthyArgonCache = true
     this.degradeState = undefined
+  }
+
+  /**
+   * Record a degraded verdict the plugin judged at an interceptable point but
+   * delivers anyway (observation only, or the re-answer budget is spent): it
+   * counts as this turn's hit exactly like a verdict that was never interceptable.
+   * @param verdict - the degraded fingerprint.
+   * @param model - model that produced it.
+   */
+  recordDeliveredHit(verdict: DegradeFingerprintResult, model: string): void {
+    if (!verdict.degraded) return
+    if (this.turnDegradeHit === undefined || verdict.score >= this.turnDegradeHit.score) this.turnDegradeHit = verdict
+    if (this.main) this.degradeState = { verdict: this.turnDegradeHit, model, updatedAt: new Date().toISOString() }
   }
 
   /**

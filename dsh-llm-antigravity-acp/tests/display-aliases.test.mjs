@@ -10,8 +10,24 @@ import { AntigravityRemote, parseConfigureRequest } from '../lib/remote.js'
 
 function fixture(extra = {}) {
   const runtime = new AntigravityRuntime({
-    config: { provider: 'antigravity', displayName: 'Antigravity', modelDisplayNames: {}, home: mkdtempSync(join(tmpdir(), 'agy-aliases-')), accounts: [], visibleModels: [], defaultEffort: 'high', contextWindow: 0, longDecodeContinuations: 3, idleSessionTtlMs: 600_000, ...extra },
-    log: { info() {}, warn() {} }, onModelsChanged() {},
+    config: {
+      provider: 'antigravity',
+      displayName: 'Antigravity',
+      modelDisplayNames: {},
+      home: mkdtempSync(join(tmpdir(), 'agy-aliases-')),
+      accounts: [],
+      visibleModels: [],
+      defaultEffort: 'high',
+      contextWindow: 0,
+      longDecodeContinuations: 3,
+      idleSessionTtlMs: 600_000,
+      keepAliveMs: 15_000,
+      quotaTtlMs: 120_000,
+      ...extra,
+    },
+    log: { info() {}, warn() {} },
+    onModelsChanged() {},
+    runCommand: async () => ({ code: 0, stdout: '', stderr: '' }),
   })
   runtime.catalog.observe([{ id: 'model', category: 'model', currentValue: 'gemini-4-argon', options: [{ value: 'gemini-4-argon', name: 'Gemini 4 Argon' }] }])
   return { runtime, adapter: new AntigravityAdapter(runtime, 'Antigravity', () => false) }

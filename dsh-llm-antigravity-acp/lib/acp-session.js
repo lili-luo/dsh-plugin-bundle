@@ -11,7 +11,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { LlmError } from '@deepseek-ai/dsh-llm';
-import { bridgeSystemPrompt, MCP_SERVER_NAME } from "./history.js";
+import { bridgeSystemPrompt, MCP_SERVER_NAME, nativeBridgeSystemPrompt } from "./history.js";
 import { labeled } from "./labels.js";
 import { recordReportedToolCall } from "./tool-bridge.js";
 import { digest } from "./util.js";
@@ -19,7 +19,7 @@ import { digest } from "./util.js";
 export const MAIN_PURPOSE = 'main';
 /** Fresh bookkeeping for one ACP session. */
 export function freshReanswer() {
-    return { rounds: 0, key: undefined, blocks: [], granted: 0, awaiting: false, freshSession: false };
+    return { rounds: 0, key: undefined, blocks: [], blocksAreReplay: false, granted: 0, awaiting: false, freshSession: false };
 }
 /** Snapshot the conflict, identity, and liveness facts the permission gate reads. */
 export function permissionState(conv) {
@@ -27,6 +27,10 @@ export function permissionState(conv) {
         sessionId: conv.sessionId,
         tenantKey: conv.tenantKey,
         turnLive: conv.turn !== undefined && !conv.turn.finished,
+        engineMode: conv.engineMode ?? 'bridge',
+        sandboxMode: conv.sandboxMode,
+        sessionCwd: conv.sessionCwd,
+        writableRoots: conv.writableRoots,
         reportedToolCalls: conv.reportedToolCalls,
         advertisedToolNames: conv.advertisedToolNames,
     };
@@ -135,7 +139,11 @@ export function mountBridge(conv, port) {
         },
         onPermission: request => port.permission(request),
     };
-    return { mcpServers, systemAppend: bridgeSystemPrompt(port.system, port.toolContracts), listener };
+    const mode = port.engineMode ?? conv.engineMode ?? 'bridge';
+    const systemAppend = mode === 'native'
+        ? nativeBridgeSystemPrompt(port.system, port.toolContracts, conv.sessionCwd)
+        : bridgeSystemPrompt(port.system, port.toolContracts);
+    return { mcpServers, systemAppend, listener };
 }
 /**
  * Drop a conversation's bridge attachment after `session/new` or `session/load`
@@ -151,10 +159,46 @@ export function detachBridge(conv, releaseTenant) {
     conv.advertisedToolNames.clear();
     conv.knownTools.clear();
 }
+/** Writes per option: the first switch, plus one retry when the read-back still differs. */
+const CONFIG_CONFIRM_ATTEMPTS = 2;
+function configOption(options, kind) {
+    return options.find(o => o.id === kind || o.category === kind);
+}
+/**
+ * Value the agent reports for one option. A missing `currentValue` means the
+ * agent did not report the option, so the conversation cache is the fallback.
+ */
+function reportedValue(option, cached) {
+    return option?.currentValue !== undefined ? option.currentValue : cached;
+}
+/**
+ * Switch one option until `configOptions` reports `target`. A read-back that
+ * already matches is left untouched. A write whose read-back reports another
+ * value is repeated once; the step then fails without recording `target`.
+ * @returns whether a write was issued.
+ */
+async function confirmConfigOption(conv, proc, sessionId, kind, target, cached, configId, port) {
+    if (reportedValue(configOption(conv.configOptions, kind), cached) === target)
+        return false;
+    let option = configOption(conv.configOptions, kind);
+    let id = option?.id ?? configId;
+    for (let attempt = 0; attempt < CONFIG_CONFIRM_ATTEMPTS; attempt++) {
+        conv.configOptions = await proc.setConfigOption(sessionId, id, target).catch((error) => { throw port.fail(error); });
+        option = configOption(conv.configOptions, kind);
+        // An agent that does not report the option cannot confirm it either way; only a
+        // reported value that differs is a failed switch.
+        if (option?.currentValue === undefined || option.currentValue === target)
+            return true;
+        if (option?.id !== undefined)
+            id = option.id;
+    }
+    const actual = option?.currentValue === undefined ? 'undefined' : option.currentValue;
+    throw new LlmError(labeled('INVALID_MODEL_CONFIG', `Antigravity kept ${kind} at "${actual}" after switching to "${target}"`), 'INVALID_MODEL_CONFIG');
+}
 /**
  * Point the ACP session at the requested model and reasoning level. agy replaces
- * the whole option list on each switch, so every step re-reads it and retries
- * once when the value did not stick.
+ * the whole option list on each switch, so every step re-reads it. The read-back
+ * `currentValue` is authoritative and is recorded only when it equals the request.
  * @param conv - conversation bound to the session.
  * @param proc - its ACP front.
  * @param model - requested model id.
@@ -164,30 +208,18 @@ export function detachBridge(conv, releaseTenant) {
  */
 export async function applyModelAndEffort(conv, proc, model, effort, port) {
     const sessionId = conv.sessionId;
-    let switched = false;
-    let modelOption = conv.configOptions.find(o => o.id === 'model' || o.category === 'model');
+    const modelOption = configOption(conv.configOptions, 'model');
     if (modelOption?.options !== undefined && !modelOption.options.some(o => o.value === model)) {
         throw new LlmError(labeled('UNKNOWN_MODEL', `Antigravity does not offer model "${model}" to this account; available: ${modelOption.options.map(o => o.value).join(', ')}`), 'UNKNOWN_MODEL');
     }
-    if (conv.model !== model && modelOption?.currentValue !== model) {
-        conv.configOptions = await proc.setConfigOption(sessionId, modelOption?.id ?? 'model', model).catch((error) => { throw port.fail(error); });
-        switched = true;
-        modelOption = conv.configOptions.find(o => o.id === 'model' || o.category === 'model');
-        if (modelOption !== undefined && modelOption.currentValue !== undefined && modelOption.currentValue !== model) {
-            conv.configOptions = await proc.setConfigOption(sessionId, modelOption.id, model).catch((error) => { throw port.fail(error); });
-        }
+    const modelSwitched = await confirmConfigOption(conv, proc, sessionId, 'model', model, conv.model, modelOption?.id ?? 'model', port);
+    const levelOption = configOption(conv.configOptions, 'thought_level');
+    const selectable = port.selectableEfforts(model);
+    let levelSwitched = false;
+    if (selectable.length > 0 && levelOption !== undefined) {
+        levelSwitched = await confirmConfigOption(conv, proc, sessionId, 'thought_level', effort, conv.effort, levelOption.id, port);
     }
     conv.model = model;
-    let levelOption = conv.configOptions.find(o => o.id === 'thought_level' || o.category === 'thought_level');
-    const selectable = port.selectableEfforts(model);
-    if (selectable.length > 0 && levelOption !== undefined && conv.effort !== effort && levelOption.currentValue !== effort) {
-        conv.configOptions = await proc.setConfigOption(sessionId, levelOption.id, effort).catch((error) => { throw port.fail(error); });
-        switched = true;
-        levelOption = conv.configOptions.find(o => o.id === 'thought_level' || o.category === 'thought_level');
-        if (levelOption !== undefined && levelOption.currentValue !== undefined && levelOption.currentValue !== effort) {
-            conv.configOptions = await proc.setConfigOption(sessionId, levelOption.id, effort).catch((error) => { throw port.fail(error); });
-        }
-    }
     conv.effort = effort;
-    return switched;
+    return modelSwitched || levelSwitched;
 }

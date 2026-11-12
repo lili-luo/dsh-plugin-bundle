@@ -15,7 +15,7 @@ import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AcpPromptResult, AcpSessionUpdate } from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
-import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from './history.ts'
+import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME, type NativeSandboxMode } from './history.ts'
 import { labeled } from './labels.ts'
 import type { StepUsageBatch, StepUsageSample } from './usage-db.ts'
 import { AsyncQueue, deferred, type Deferred } from './util.ts'
@@ -153,6 +153,16 @@ export interface ParkedCall {
   readonly result: Deferred<BridgeToolResult>
 }
 
+/** One native built-in tool permission refusal observed during an ACP turn. */
+export interface NativePermissionDenial {
+  readonly tool: string
+  readonly reason: string
+  readonly sandboxMode: NativeSandboxMode
+}
+
+/** Maximum in-place continuation prompts sent per turn when `agy` ends a turn right after a native permission denial. */
+export const MAX_PERMISSION_CONTINUATIONS = 2
+
 /** Event observed during one ACP turn. */
 export type TurnEvent =
   | { kind: 'thought'; text: string }
@@ -210,6 +220,12 @@ export class AcpTurn {
   toolSteps = 0
   /** Long-decode continuations sent in this turn. */
   continuations = 0
+  /** In-place continuations sent after `agy` aborted `session/prompt` on a denied native built-in tool call. */
+  permissionContinuations = 0
+  /** Unhandled native built-in permission denials since the last visible text or MCP tool park. */
+  readonly pendingNativeDenials: NativePermissionDenial[] = []
+  /** Most recent native built-in permission denial in this turn, used as visible fallback after continuation cap. */
+  lastNativeDenial: NativePermissionDenial | undefined
   /** The agent ended the prompt. */
   finished = false
   /** A parked call was answered with a still-running notice and the agent has not resumed waiting yet. */
@@ -234,10 +250,15 @@ export class AcpTurn {
   }
   /** Usage read from the session DB for the step that is ending, not yet reported. */
   private stagedUsage: StepUsageSample | undefined
+  /** Built-in non-MCP toolCallIds already traced to `reasoning` in `native` mode. */
+  private readonly tracedToolCallIds = new Set<string>()
   private nextCall = 0
 
-  /** @param turnTag - unique per-turn hex tag used in synthesized call ids (`agy_<turnTag>_<n>`). */
-  constructor(private readonly turnTag: string) {}
+  /**
+   * @param turnTag - unique per-turn hex tag used in synthesized call ids (`agy_<turnTag>_<n>`).
+   * @param nativeMode - whether to emit concise `[agy]` reasoning traces for built-in tool calls.
+   */
+  constructor(private readonly turnTag: string, private readonly nativeMode = false) {}
 
   /**
    * Record one batch of per-step model usage read from the local session DB.
@@ -302,6 +323,16 @@ export class AcpTurn {
   }
 
   /**
+   * Record one denied native built-in tool call so an immediate zero-output
+   * `end_turn` from `agy` can continue in-place instead of failing with `EMPTY_RESPONSE`.
+   * @param denial - the refused native built-in call details.
+   */
+  noteNativeDenial(denial: NativePermissionDenial): void {
+    this.pendingNativeDenials.push(denial)
+    this.lastNativeDenial = denial
+  }
+
+  /**
    * Register one agent tool call.
    * @param name - DSH tool name.
    * @param args - parsed arguments.
@@ -311,6 +342,7 @@ export class AcpTurn {
     const held = this.recoverNoticeHold()
     if (held.length > 0 && !this.relaying) this.events.push({ kind: 'text', text: held })
     this.agentFailure = undefined
+    this.pendingNativeDenials.length = 0
     const call: ParkedCall = {
       id: ToolCallId(`agy_${this.turnTag}_${++this.nextCall}`),
       name,
@@ -336,6 +368,22 @@ export class AcpTurn {
       const held = this.recoverNoticeHold()
       if (held.length > 0 && !this.relaying) this.events.push({ kind: 'text', text: held })
       if (text.length > 0 && !this.relaying) this.events.push({ kind: 'thought', text })
+      return
+    }
+    if (
+      this.nativeMode
+      && (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
+      && typeof update.toolCallId === 'string'
+      && update.toolCallId.length > 0
+      && !this.tracedToolCallIds.has(update.toolCallId)
+    ) {
+      const summary = summarizeNativeBuiltinToolUpdate(update)
+      if (summary !== undefined) {
+        this.tracedToolCallIds.add(update.toolCallId)
+        const held = this.recoverNoticeHold()
+        if (held.length > 0 && !this.relaying) this.events.push({ kind: 'text', text: held })
+        if (!this.relaying) this.events.push({ kind: 'thought', text: `\n[agy] ${summary}\n` })
+      }
     }
   }
 
@@ -363,7 +411,10 @@ export class AcpTurn {
       this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code)
       return
     }
-    if (combined.trim().length > 0) this.agentFailure = undefined
+    if (combined.trim().length > 0) {
+      this.agentFailure = undefined
+      this.pendingNativeDenials.length = 0
+    }
     if (!this.relaying) this.events.push({ kind: 'text', text: combined })
   }
 
@@ -389,7 +440,10 @@ export class AcpTurn {
     if (this.agentFailure !== undefined && WARNING_PREFIX.test(held)) {
       return ''
     }
-    if (held.trim().length > 0) this.agentFailure = undefined
+    if (held.trim().length > 0) {
+      this.agentFailure = undefined
+      this.pendingNativeDenials.length = 0
+    }
     return this.relaying ? '' : held
   }
 
@@ -405,16 +459,48 @@ export class AcpTurn {
   }
 }
 
+function summarizeNativeBuiltinToolUpdate(update: AcpSessionUpdate): string | undefined {
+  const meta = update._meta
+  const mcpServer = update.mcpServerName ?? meta?.mcpServerName ?? meta?.serverName ?? meta?.server
+  if (typeof mcpServer === 'string' && mcpServer.length > 0) return undefined
+  if (typeof update.mcpToolName === 'string' && update.mcpToolName.length > 0) return undefined
+  if (typeof meta?.mcpToolName === 'string' && meta?.mcpToolName.length > 0) return undefined
+  const rawName = typeof update.name === 'string' && update.name.trim().length > 0
+    ? update.name.trim()
+    : (typeof meta?.name === 'string' && meta.name.trim().length > 0 ? meta.name.trim() : '')
+  const rawTitle = typeof update.title === 'string' ? update.title.replace(/\s+/gu, ' ').trim() : ''
+  if (rawName.startsWith('mcp_') || rawTitle.startsWith('mcp_')) return undefined
+  let detail = ''
+  if (Array.isArray(update.locations) && typeof update.locations[0]?.path === 'string') {
+    detail = update.locations[0].path.trim()
+  } else if (update.rawInput !== null && typeof update.rawInput === 'object' && !Array.isArray(update.rawInput)) {
+    const rec = update.rawInput as Record<string, unknown>
+    const candidate = rec.Path ?? rec.path ?? rec.CommandLine ?? rec.command ?? rec.query
+    if (typeof candidate === 'string') detail = candidate.replace(/\s+/gu, ' ').trim()
+  }
+  if (detail.length > 100) detail = `${detail.slice(0, 99)}…`
+  const head = rawTitle.length > 0
+    ? (rawName.length > 0 && rawTitle !== rawName && !rawTitle.includes(rawName) ? `${rawName}: ${rawTitle}` : rawTitle)
+    : (rawName.length > 0 ? rawName : (typeof update.kind === 'string' && update.kind.length > 0 && update.kind !== 'other' ? update.kind : ''))
+  if (head.length === 0) return undefined
+  const full = detail.length > 0 && !head.includes(detail) ? `${head} (${detail})` : head
+  return full.length > 160 ? `${full.slice(0, 159)}…` : full
+}
+
 /** Effects the pump needs from its owner. */
 export interface PumpHost {
   /** Window that groups parallel tool calls. */
   parkSettleMs: number
   /** Allowed long-decode continuations. */
   maxContinuations: number
+  /** Allowed in-place continuations after native built-in permission denials (default {@link MAX_PERMISSION_CONTINUATIONS}). */
+  maxPermissionContinuations?: number
   /** Hold `text` chunks in memory while zero `thought` chunks have arrived in the current attempt. */
   holdZeroThoughtText?: boolean
   /** Send one continuation prompt in the same session; resolves with its result. */
   continuePrompt(): Promise<AcpPromptResult>
+  /** Send one in-place sandbox-policy refusal notice in the same session when `agy` aborts a turn after denying a built-in tool. */
+  continueAfterPermissionDenial?(denials: readonly NativePermissionDenial[]): Promise<AcpPromptResult>
   /** Request cancellation of the running turn. */
   cancel(): void
   /** Observe the final usage of a prompt turn. */
@@ -588,6 +674,19 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
           )
           break
         }
+        if (stop === 'end_turn' && turn.pendingNativeDenials.length > 0) {
+          const denials = turn.pendingNativeDenials.splice(0)
+          const maxPermCont = host.maxPermissionContinuations ?? MAX_PERMISSION_CONTINUATIONS
+          if (host.continueAfterPermissionDenial !== undefined && turn.permissionContinuations < maxPermCont) {
+            yield * flushHeldText()
+            turn.permissionContinuations++
+            void host.continueAfterPermissionDenial(denials).then(
+              result => turn.events.push({ kind: 'done', result }),
+              (error: unknown) => turn.events.push({ kind: 'error', error: error instanceof Error ? error : new Error(String(error)) }),
+            )
+            break
+          }
+        }
         if (stop === 'end_turn' && host.verifyEndTurn !== undefined) {
           const hadZeroThoughtHold = !sawStepThought && heldZeroThoughtText.length > 0 && !emittedVisibleText
           if (await host.verifyEndTurn(hadZeroThoughtHold) === 'degrade') {
@@ -601,9 +700,16 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
           }
         }
         yield * flushHeldText()
+        if (stop === 'end_turn' && !turn.produced && turn.lastNativeDenial !== undefined) {
+          const d = turn.lastNativeDenial
+          const fallback = `Operation refused by DSH sandbox policy (${d.sandboxMode}): ${d.tool} (${d.reason}).`
+          turn.produced = true
+          emittedVisibleText = true
+          yield * append('text', fallback)
+        }
         turn.finished = true
         yield * close()
-        const calls = turn.toolSteps + turn.continuations + 1
+        const calls = turn.toolSteps + turn.continuations + turn.permissionContinuations + 1
         host.recordUsage(event.result.usage, calls)
         const finalSample = await host.consumeStepUsage?.({ final: true })
         let usage: TokenUsage | undefined

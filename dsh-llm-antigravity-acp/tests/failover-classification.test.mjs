@@ -36,7 +36,7 @@ function account(id, extra = {}) {
  * fake's `RATELIMIT` directive answers with a transient 429. Other accounts
  * stay healthy.
  */
-function makeRuntime({ accounts = [], quotaAccounts = [], ratelimitAccounts = [], omitArgonAccounts = [], usageByHome = {} } = {}) {
+function makeRuntime({ accounts = [], quotaAccounts = [], ratelimitAccounts = [], omitArgonAccounts = [], usageByHome = {}, degradeAction } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'agy-failover-class-test-'))
   const armedHomes = new Set(quotaAccounts.map(entry => entry.homeDir))
   const throttledHomes = new Set(ratelimitAccounts.map(entry => entry.homeDir))
@@ -48,6 +48,7 @@ function makeRuntime({ accounts = [], quotaAccounts = [], ratelimitAccounts = []
     contextWindow: 0, defaultEffort: 'high', autoPatch: false, patchScript: join(home, 'missing.py'),
     maxLiveSessions: 16, idleSessionTtlMs: 600_000, parkSettleMs: 80, keepAliveMs: 1_000,
     longDecodeContinuations: 3, warmup: false, quotaTtlMs: 60_000,
+    ...degradeAction === undefined ? {} : { degradeAction },
   }
   const runtime = new AntigravityRuntime({
     config,
@@ -173,7 +174,9 @@ test('a transient rate limit fails the same step over to a healthy account with 
 test('a degraded route fails the step without cooling the account down or failing it over', async () => {
   const a = account('a')
   const b = account('b')
-  const { runtime, adapter, prompts } = makeRuntime({ accounts: [a, b] })
+  // The refusal path is what this test pins, so it opts into the level that
+  // refuses on any degraded verdict.
+  const { runtime, adapter, prompts } = makeRuntime({ accounts: [a, b], degradeAction: 'legacy' })
 
   const degradedText = {
     text: '我明白您的意思了，我将先检查代码中处理额度显示逻辑的相关部分。',
@@ -204,9 +207,9 @@ test('a degraded route fails the step without cooling the account down or failin
   assert.equal(prompts(b).length, 0, 'the other account was never asked')
   const afterText = prompts(a).length
 
-  // A degraded tool gate that survives both automatic re-answers aborts with
-  // its own code, which the retry layer does not treat as a quota failure.
-  const toolPrompt = `GATEDCALL ${JSON.stringify(degradedTool)} => ${JSON.stringify(degradedTool)} => ${JSON.stringify(degradedTool)}`
+  // A degraded tool gate that survives all four automatic re-answers hands its
+  // tool call to the harness instead of aborting, and still never fails over.
+  const toolPrompt = `GATEDCALL ${JSON.stringify(degradedTool)} => ${JSON.stringify(degradedTool)} => ${JSON.stringify(degradedTool)} => ${JSON.stringify(degradedTool)} => ${JSON.stringify(degradedTool)}`
   const request = () => adapter.stream({
     provider: 'antigravity',
     model: 'gemini-4-argon',
@@ -214,23 +217,20 @@ test('a degraded route fails the step without cooling the account down or failin
     tools: [bash],
     messages: [sys, user('u1', toolPrompt)],
   })
-  const first = await rejectionOf(request())
-  assert.equal(first.code, 'DEGRADED_ROUTE', 'the first gate degrade asks for a re-answer')
-  const second = await rejectionOf(request())
-  assert.equal(second.code, 'DEGRADED_ROUTE', 'the second gate degrade asks for one more re-answer')
-  const third = await rejectionOf(request())
-  assert.equal(third.code, 'DEGRADED_ROUTE_EXHAUSTED', 'the exhausted re-answer keeps its own documented code')
-  assert.match(third.message, /降智未恢复/, 'the caller sees the real cause, not a quota story')
-  assert.doesNotMatch(third.message, /No Antigravity account/)
-  assert.deepEqual(cooldownsOf(runtime, 'a'), [], 'the abort parks nothing on the first account')
-  assert.deepEqual(cooldownsOf(runtime, 'b'), [], 'the abort parks nothing on the second account')
-  // A new conversation may be balanced onto either account; all three of its
+  for (const [index, code] of [await rejectionOf(request()), await rejectionOf(request()), await rejectionOf(request()), await rejectionOf(request())].entries()) {
+    assert.equal(code.code, 'DEGRADED_ROUTE', `gate degrade ${index + 1} asks for another re-answer`)
+  }
+  const fifth = await collect(request())
+  assert.equal(fifth.at(-1).reason.kind, 'tool-calls', 'the exhausted budget delivers the tool call to the harness')
+  assert.deepEqual(cooldownsOf(runtime, 'a'), [], 'the exhausted budget parks nothing on the first account')
+  assert.deepEqual(cooldownsOf(runtime, 'b'), [], 'the exhausted budget parks nothing on the second account')
+  // A new conversation may be balanced onto either account; all five of its
   // attempts must still run on the one account it was given.
   const servedA = prompts(a).length - afterText
   const servedB = prompts(b).length
   assert.ok(
-    (servedA === 3 && servedB === 0) || (servedA === 0 && servedB === 3),
+    (servedA === 5 && servedB === 0) || (servedA === 0 && servedB === 5),
     `each attempt ran one session/prompt on the conversation's own account (a: ${servedA}, b: ${servedB})`,
   )
-  assert.equal(runtime.status().lastAccount, servedA === 3 ? 'a' : 'b', 'the abort never fails over to another account')
+  assert.equal(runtime.status().lastAccount, servedA === 5 ? 'a' : 'b', 'the step never fails over to another account')
 })

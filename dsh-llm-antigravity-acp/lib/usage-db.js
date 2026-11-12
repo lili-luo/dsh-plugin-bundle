@@ -580,8 +580,17 @@ export function readModelStepTail(dbPath, limit) {
     }
 }
 /**
+ * Whether one model id belongs to the Gemini 4 flagship families (`gemini-4-argon`,
+ * `gemini-4-carbon`) that share the fallback-routing pool the route-health fingerprint judges.
+ * @param model - model id or display name.
+ * @returns true for every Argon or Carbon variant.
+ */
+export function isGemini4Flagship(model) {
+    return /argon|carbon/i.test(model);
+}
+/**
  * Evaluate the 5-dimensional physical shadow-degradation fingerprint on one model step.
- * Only `gemini-4-argon` family requests with non-zero billing are evaluated; a total score `>= 3`
+ * Only Gemini 4 flagship (`gemini-4-argon`, `gemini-4-carbon`) requests with non-zero billing are evaluated; a total score `>= 3`
  * diagnoses upstream fallback routing while keeping single borderline metrics below threshold.
  * `block_cache` is only corroborating evidence, so signals consisting solely of it never degrade
  * on their own.
@@ -598,7 +607,7 @@ export function evaluateDegradeFingerprint(input) {
     const ttftSeconds = Math.round(Math.max(0, step.ttftSeconds) * 100) / 100;
     const blockAlignedCache = step.cachedReadTokens >= 4_096 && step.cachedReadTokens % 2048 === 0;
     const exactPrefixCache = step.cachedReadTokens > 0 && step.cachedReadTokens % 2048 !== 0;
-    if (!/argon/i.test(input.model) || (contextTokens === 0 && step.outputTokens === 0)) {
+    if (!isGemini4Flagship(input.model) || (contextTokens === 0 && step.outputTokens === 0)) {
         return {
             evaluated: false,
             degraded: false,

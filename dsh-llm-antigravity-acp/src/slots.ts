@@ -10,7 +10,7 @@ import { accountEnv, type AccountLayout } from './accounts.ts'
 import type { AcpProcess } from './acp-process.ts'
 import type { CatalogModel } from './catalog.ts'
 import type { SubscriptionTier } from './cloudcode.ts'
-import type { Effort } from './config.ts'
+import type { Effort, EngineMode } from './config.ts'
 import type { PreflightResult } from './preflight.ts'
 
 /** Everything owned by one account: its sandbox, its preflight facts, and its ACP front. */
@@ -22,6 +22,10 @@ export interface AccountSlot {
   preflightPromise: Promise<PreflightResult> | undefined
   process: AcpProcess | undefined
   starting: Promise<AcpProcess> | undefined
+  /** Engine mode the running ACP front was started with, or undefined while idle. */
+  engineMode: EngineMode | undefined
+  /** Working directory the running ACP front process was spawned in, or undefined while idle. */
+  frontCwd: string | undefined
   state: 'idle' | 'starting' | 'ready' | 'error'
   error: string | undefined
   /** When this account's ACP front last became ready, so warm fronts are not swept away. */
@@ -58,6 +62,8 @@ export function newSlot(layout: AccountLayout): AccountSlot {
     preflightPromise: undefined,
     process: undefined,
     starting: undefined,
+    engineMode: undefined,
+    frontCwd: undefined,
     state: 'idle',
     error: undefined,
     readyAt: 0,
@@ -89,15 +95,17 @@ export function rebaseSlot(slot: AccountSlot, layout: AccountLayout): boolean {
 }
 
 /**
- * Whether upstream marked one model disabled on an account. Argon is listed by
- * family name (`gemini-4-argon`), so one Argon entry covers every Argon variant
- * of that account.
+ * Whether upstream marked one model disabled on an account. Argon and Carbon
+ * are listed by family name (`gemini-4-argon`, `gemini-4-carbon`), so one
+ * family entry covers every variant of that family on the account.
  * @param slot - account slot.
  * @param model - model asked about.
  * @returns true when the account's own report disables the model.
  */
 export function slotDisablesModel(slot: AccountSlot, model: string): boolean {
-  return slot.disabledModels?.some(entry => entry === model || (/argon/i.test(entry) && /argon/i.test(model))) === true
+  return slot.disabledModels?.some(entry => entry === model
+    || (/argon/i.test(entry) && /argon/i.test(model))
+    || (/carbon/i.test(entry) && /carbon/i.test(model))) === true
 }
 
 /**

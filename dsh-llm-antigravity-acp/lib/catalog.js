@@ -33,6 +33,7 @@ export function intersectVisible(provider, account) {
 }
 /** Families shown before the first ACP session reports the account's catalog. */
 export const FALLBACK_MODELS = [
+    { id: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
     { id: 'gemini-4-argon', name: 'Gemini 4 Argon' },
     { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash' },
     { id: 'claude-opus-5-5', name: 'Claude Opus 5.5' },

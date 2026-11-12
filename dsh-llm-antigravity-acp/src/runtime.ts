@@ -8,7 +8,8 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
@@ -24,13 +25,13 @@ import {
   type CooldownKey, type Family, type LoginResult, type LoginTicket,
 } from './accounts.ts'
 import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type AvailableModel, type CatalogModel } from './catalog.ts'
-import { asEffort, current, type AccountProfile, type Config, type Effort } from './config.ts'
-import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedExhaustedError, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type ParkedCall } from './conversation.ts'
+import { asDegradeAction, asEffort, asEngineMode, current, type AccountProfile, type Config, type DegradeAction, type Effort, type EngineMode } from './config.ts'
+import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
 import { unlockAccountKeychain } from './credential.ts'
 import {
-  AGENT_TOOL_PREFIX, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES,
+  AGENT_TOOL_PREFIX, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, prepareNativeRequest,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
-  type AcpPromptBlock, type ImageResolver,
+  type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext,
 } from './history.ts'
 import { labeled } from './labels.ts'
 import { JsonRpcClosedError, JsonRpcRemoteError } from './jsonrpc.ts'
@@ -41,26 +42,47 @@ import {
 } from './preflight.ts'
 import { groupForModel, isWeeklyBucket, QuotaReader, resolveModelQuota, type QuotaSnapshot } from './quota.ts'
 import { RouteHealth, type RouteHealthSnapshot } from './route-health.ts'
+import { binaryDigest, pluginBuildDigest } from './run-fingerprint.ts'
 import { SessionStore } from './session-store.ts'
 import { newSlot, rebaseSlot, slotDeniesModel, slotDisablesModel, type AccountSlot } from './slots.ts'
 import {
-  answerPermission as decidePermission, consumeToolDelta, resolveActiveToolSchemas, toBridgeTools,
-  MAX_EAGER_BRIDGE_TOOL_BYTES,
+  answerPermission as decidePermission, boundBridgeContent, consumeToolDelta, filterToolsForEngineMode,
+  MAX_EAGER_BRIDGE_TOOL_BYTES, resolveActiveToolSchemas, toBridgeTools,
 } from './tool-bridge.ts'
 import {
-  hasGenMetadata, peekMaxGenMetadataIdx, peekMaxModelStepIdx,
+  hasGenMetadata, isGemini4Flagship, peekMaxGenMetadataIdx, peekMaxModelStepIdx,
   readGenUsageAfter, readModelStepTail, readModelStepsAfter, sessionDbPath,
   type DegradeFingerprintResult,
 } from './usage-db.ts'
 import { delay, digest, KeyedMutex } from './util.ts'
 
 // The tool-bridge helpers stay importable from this module for existing consumers.
-export { compactBridgeTool, consumeToolDelta, MAX_EAGER_BRIDGE_TOOL_BYTES, resolveActiveToolSchemas } from './tool-bridge.ts'
+export {
+  boundBridgeContent, boundBridgeToolText, compactBridgeTool, consumeToolDelta, filterToolsForEngineMode,
+  MAX_BRIDGE_RESULT_BYTES, MAX_EAGER_BRIDGE_TOOL_BYTES, NATIVE_OVERLAPPING_DSH_TOOLS, resolveActiveToolSchemas,
+} from './tool-bridge.ts'
 
 /** Parked calls answer with a still-running notice before Gemini cache TTL expiry and agy's 180-second MCP deadline. */
 export const DEFAULT_RELAY_AFTER_MS = 85_000
-/** Automatic re-answers granted for one identical request before a degraded answer is delivered as it is. */
-const MAX_REANSWERS_PER_REQUEST = 2
+/** Automatic re-answers granted for one identical request before a degraded answer is delivered as it is. Matches the harness request-retry budget so the plugin never gives up while DSH would still retry. */
+const MAX_REANSWERS_PER_REQUEST = 4
+/**
+ * Automatic re-answers granted across every step of one user turn (the steps
+ * that answer the same latest user message). Without it each tool step is a new
+ * request and would get a fresh per-request budget, so one user turn could be
+ * refused and re-rolled dozens of times.
+ */
+const MAX_REANSWERS_PER_USER_TURN = 4
+/**
+ * Re-answers that stay in the same ACP session before the next one is forced into a
+ * fresh session. The fallback pool's block-quantized prefix cache keeps matching a
+ * warm session's prefix, so a reroll that already failed once rarely escapes in place.
+ */
+const SAME_SESSION_REANSWERS = 2
+/** ACP `clientInfo.name`, matching the official Antigravity client identity. */
+const ACP_CLIENT_NAME = 'antigravity'
+/** ACP `clientInfo.version` when `agy --version` reports no semver. */
+const FALLBACK_ACP_CLIENT_VERSION = '1.5.5'
 /** Failure text of a provider whose account list is empty, which only the settings page can fix. */
 const NO_ACCOUNT_MESSAGE = '没有可用的 Antigravity 账号，请在设置页添加账号或使用本机登录。'
 const CONTINUE_PROMPT = 'Continue exactly where your previous output stopped. Do not repeat any earlier text.'
@@ -87,6 +109,10 @@ export interface LiveOverrides {
   contextWindow?: number
   defaultEffort?: Effort
   longDecodeContinuations?: number
+  /** Route-health intervention level for Gemini 4 flagship steps; see {@link DegradeAction}. */
+  degradeAction?: DegradeAction
+  /** ACP agent engine mode (`bridge` or `native`); see {@link EngineMode}. */
+  engineMode?: EngineMode
   /**
    * Replace the whole account list, the machine account included as its
    * `system: true` entry. A list without one means the machine account was
@@ -121,6 +147,10 @@ export interface RuntimeStatus {
   configuredContextWindow: number
   defaultEffort: Effort
   longDecodeContinuations: number
+  /** Live route-health intervention level. */
+  degradeAction: DegradeAction
+  /** Live ACP agent engine mode (`bridge` or `native`). */
+  engineMode: EngineMode
   models: { id: string; name: string }[]
   /** Every advertised family with the visibility the current allowlist gives it. */
   availableModels: { id: string; name: string; enabled: boolean }[]
@@ -172,6 +202,8 @@ export class AntigravityRuntime implements AccountAdmin {
   private readonly capacityMutex = new KeyedMutex()
   /** Serializes pre-execution `gen_metadata` checks for parallel tool calls within the same conversation. */
   private readonly gateMutex = new KeyedMutex()
+  /** Re-answer budget of each conversation's current user turn; survives ACP session replacement. */
+  private readonly turnBudgets = new WeakMap<Conversation, { turnKey: string; granted: number }>()
   private sweeper: ReturnType<typeof setInterval> | undefined
   private lastTurn: RuntimeStatus['lastTurn']
   private overrides: LiveOverrides = {}
@@ -224,6 +256,8 @@ export class AntigravityRuntime implements AccountAdmin {
     this.sessions.save(conv.dshSessionId, {
       acpSessionId: conv.sessionId,
       accountId: conv.accountId,
+      engineMode: conv.engineMode ?? 'bridge',
+      ...(conv.sessionCwd !== undefined ? { sessionCwd: conv.sessionCwd } : {}),
       systemHash: conv.systemHash,
       knownIds: [...conv.knownIds],
       advertisedTools: conv.advertisedTools.map(t => ({ ...t })),
@@ -302,6 +336,11 @@ export class AntigravityRuntime implements AccountAdmin {
     return this.catalog.fixedEffort(model) ?? requested
   }
 
+  /** Default effort. */
+  defaultEffort(): Effort {
+    return this.overrides.defaultEffort ?? current(this.host.config.defaultEffort)
+  }
+
   /** Current provider alias; never used as a route id. */
   displayName(): string {
     return (this.overrides.displayName ?? current(this.host.config.displayName) ?? '').trim() || 'Antigravity'
@@ -315,17 +354,23 @@ export class AntigravityRuntime implements AccountAdmin {
   /** Resolve a presentation label without mutating the canonical catalog. */
   modelDisplayName(id: string, fallback: string): string {
     const names = this.overrides.modelDisplayNames ?? current(this.host.config.modelDisplayNames) ?? {}
-    return Object.hasOwn(names, id) && names[id]?.trim() ? names[id]!.trim() : fallback
-  }
-
-  /** Default effort. */
-  defaultEffort(): Effort {
-    return this.overrides.defaultEffort ?? current(this.host.config.defaultEffort)
+    return Object.hasOwn(names, id) && names[id]?.trim() ? names[id].trim() : fallback
   }
 
   /** Maximum automatic long-decode continuations. */
   longDecodeContinuations(): number {
     return this.overrides.longDecodeContinuations ?? current(this.host.config.longDecodeContinuations)
+  }
+
+  /**
+   * Active ACP agent engine mode: the settings-card override, then the volatile
+   * config field, then `bridge`.
+   * @returns the active engine mode.
+   */
+  engineMode(): EngineMode {
+    return this.overrides.engineMode
+      ?? asEngineMode(current((this.host.config as { engineMode?: unknown }).engineMode))
+      ?? 'bridge'
   }
 
   /** Provider-level model allowlist; empty offers every advertised family. */
@@ -367,6 +412,7 @@ export class AntigravityRuntime implements AccountAdmin {
    * @returns updated status.
    */
   configure(patch: LiveOverrides): RuntimeStatus {
+    const prevEngineMode = this.engineMode()
     const next: LiveOverrides = { ...patch }
     if (next.visibleModels !== undefined) next.visibleModels = accountVisibleModels(next.visibleModels)
     let accounts = next.accounts
@@ -380,10 +426,43 @@ export class AntigravityRuntime implements AccountAdmin {
       ))
     }
     this.overrides = { ...this.overrides, ...next, ...accounts !== undefined ? { accounts } : {} }
+    const nextEngineMode = this.engineMode()
+    if (prevEngineMode !== nextEngineMode) this.applyEngineModeChange(nextEngineMode)
     if (next.accounts !== undefined) this.applyAccounts()
     if (next.visibleModels !== undefined) this.catalog.applyVisibility(this.providerVisible())
     this.host.onModelsChanged()
     return this.status()
+  }
+
+  private applyEngineModeChange(nextMode: EngineMode): void {
+    for (const conv of this.conversations.values()) {
+      if (conv.engineMode !== undefined && conv.engineMode !== nextMode) {
+        this.dropTurn(conv, 'Antigravity engine mode changed; restarting ACP session.')
+        void this.resetSession(conv)
+      }
+    }
+    for (const slot of this.slots.values()) {
+      if (slot.process !== undefined || slot.starting !== undefined || (slot.engineMode !== undefined && slot.engineMode !== nextMode)) {
+        this.stopSlotProcess(slot, 'Antigravity engine mode changed; restarting ACP front.')
+      }
+    }
+  }
+
+  private stopSlotProcess(slot: AccountSlot, reason: string): void {
+    const proc = slot.process
+    for (const conv of this.conversations.values()) {
+      if (conv.accountId === slot.layout.id || (proc !== undefined && conv.process === proc)) {
+        this.dropTurn(conv, reason)
+        void this.resetSession(conv)
+      }
+    }
+    slot.process = undefined
+    slot.starting = undefined
+    slot.engineMode = undefined
+    slot.frontCwd = undefined
+    slot.state = 'idle'
+    slot.error = undefined
+    proc?.stop()
   }
 
   private applyAccounts(): void {
@@ -407,10 +486,7 @@ export class AntigravityRuntime implements AccountAdmin {
         continue
       }
       if (rebaseSlot(slot, layout) && slot.process !== undefined) {
-        slot.process.stop()
-        slot.process = undefined
-        slot.starting = undefined
-        slot.state = 'idle'
+        this.stopSlotProcess(slot, 'Account environment changed; restarting ACP front.')
       }
     }
     this.quota.clear()
@@ -539,6 +615,8 @@ export class AntigravityRuntime implements AccountAdmin {
       configuredContextWindow: this.configuredContextWindow(),
       defaultEffort: this.defaultEffort(),
       longDecodeContinuations: this.longDecodeContinuations(),
+      degradeAction: this.degradeAction(),
+      engineMode: this.engineMode(),
       models: this.catalog.list().map(m => ({ ...m })),
       availableModels: this.catalog.availableModels().map(m => ({ ...m })),
       visibleModels: this.providerVisible(),
@@ -791,11 +869,38 @@ export class AntigravityRuntime implements AccountAdmin {
     throw new LlmError(labeled('AUTH', 'No enabled Antigravity account is configured'), 'AUTH')
   }
 
-  private async ensureSlotReady(slot: AccountSlot): Promise<AcpProcess> {
+  private slotHasLiveSessions(proc: AcpProcess): boolean {
+    for (const conv of this.conversations.values()) {
+      if (conv.process !== proc) continue
+      if (conv.sessionId !== undefined || (conv.turn !== undefined && !conv.turn.finished)) return true
+    }
+    return false
+  }
+
+  private async ensureSlotReady(slot: AccountSlot, preferredCwd?: string): Promise<AcpProcess> {
     if (this.disposed) throw new LlmError(labeled('TRANSPORT', 'Antigravity provider was disposed'), 'TRANSPORT')
+    const activeMode = this.engineMode()
+    if (slot.engineMode !== undefined && slot.engineMode !== activeMode) {
+      this.stopSlotProcess(slot, 'Antigravity engine mode changed; restarting ACP front.')
+    } else if (
+      activeMode === 'native'
+      && preferredCwd !== undefined
+      && slot.process?.alive === true
+      && slot.frontCwd !== undefined
+      && slot.frontCwd !== preferredCwd
+      && !this.slotHasLiveSessions(slot.process)
+    ) {
+      this.stopSlotProcess(slot, 'Restarting idle native ACP front in session working directory.')
+    }
     if (slot.process?.alive === true) return slot.process
-    slot.starting ??= this.startSlot(slot).finally(() => { slot.starting = undefined })
-    return slot.starting
+    slot.starting ??= this.startSlot(slot, preferredCwd).finally(() => { slot.starting = undefined })
+    const proc = await slot.starting
+    if (slot.engineMode !== this.engineMode()) {
+      this.stopSlotProcess(slot, 'Antigravity engine mode changed during startup; restarting ACP front.')
+      slot.starting ??= this.startSlot(slot, preferredCwd).finally(() => { slot.starting = undefined })
+      return slot.starting
+    }
+    return proc
   }
 
   /**
@@ -865,6 +970,8 @@ export class AntigravityRuntime implements AccountAdmin {
     for (const slot of this.slots.values()) {
       slot.process?.stop()
       slot.process = undefined
+      slot.engineMode = undefined
+      slot.frontCwd = undefined
       slot.state = 'idle'
     }
     await this.bridge.close()
@@ -1063,38 +1170,101 @@ export class AntigravityRuntime implements AccountAdmin {
 
   /** One attempt of a step on one account; throws when that account cannot serve it. */
   private async * attempt(conv: Conversation, slot: AccountSlot, options: GenerateOptions): AsyncGenerator<StreamChunk> {
-    const proc = await this.ensureSlotReady(slot)
     if (conv.accountId !== slot.layout.id) {
       this.dropTurn(conv, 'Rebuilding on another account.')
       await this.resetSession(conv)
       conv.accountId = slot.layout.id
     }
-    const split = splitSystem(options)
-    const activeSchemas = resolveActiveToolSchemas(options.tools, split.messages)
+    const desiredMode = this.engineMode()
+    let systemText: string
+    let preparedMessages: readonly RequestMessage[]
+    let nativeReq: ReturnType<typeof prepareNativeRequest> | undefined
+    let preferredNativeCwd: string | undefined
+    if (desiredMode === 'native') {
+      nativeReq = prepareNativeRequest(options)
+      systemText = nativeReq.rulesText
+      preparedMessages = nativeReq.messages
+      preferredNativeCwd = canonicalizeExistingDir(nativeReq.sessionContext.cwd)
+    } else {
+      const split = splitSystem(options)
+      systemText = split.system
+      preparedMessages = split.messages
+    }
+    const preCheckCwd = desiredMode === 'native'
+      ? (preferredNativeCwd ?? canonicalizeExistingDir(slot.layout.workspace) ?? slot.layout.workspace)
+      : slot.layout.workspace
+    if (
+      conv.sessionId !== undefined
+      && ((conv.engineMode !== undefined && conv.engineMode !== desiredMode)
+        || (conv.sessionCwd !== undefined && conv.sessionCwd !== preCheckCwd))
+    ) {
+      this.dropTurn(conv, 'Session engine mode or working directory changed; rebuilding ACP session.')
+      await this.resetSession(conv)
+    }
+    const proc = await this.ensureSlotReady(slot, desiredMode === 'native' ? preferredNativeCwd : undefined)
+    const engineMode = slot.engineMode ?? desiredMode
+    if (engineMode !== desiredMode) {
+      // Mode flipped while ensureSlotReady awaited; align prepared request to the running slot.
+      if (engineMode === 'native') {
+        nativeReq = prepareNativeRequest(options)
+        systemText = nativeReq.rulesText
+        preparedMessages = nativeReq.messages
+        preferredNativeCwd = canonicalizeExistingDir(nativeReq.sessionContext.cwd)
+      } else {
+        nativeReq = undefined
+        const split = splitSystem(options)
+        systemText = split.system
+        preparedMessages = split.messages
+      }
+    }
+    const effectiveCwd = engineMode === 'native'
+      ? (preferredNativeCwd ?? canonicalizeExistingDir(slot.layout.workspace) ?? slot.layout.workspace)
+      : slot.layout.workspace
+    const sandboxMode: NativeSandboxMode | undefined = engineMode === 'native'
+      ? (nativeReq?.sessionContext.sandboxMode ?? 'workspace-write')
+      : undefined
+    const writableRoots: readonly string[] = engineMode === 'native'
+      ? buildWritableRoots(effectiveCwd, nativeReq?.sessionContext ?? {})
+      : []
+    if (
+      conv.sessionId !== undefined
+      && ((conv.engineMode !== undefined && conv.engineMode !== engineMode)
+        || (conv.sessionCwd !== undefined && conv.sessionCwd !== effectiveCwd))
+    ) {
+      this.dropTurn(conv, 'Session engine mode or working directory changed; rebuilding ACP session.')
+      await this.resetSession(conv)
+    }
+    const filteredTools = filterToolsForEngineMode(options.tools, engineMode)
+    const activeSchemas = resolveActiveToolSchemas(filteredTools, preparedMessages)
     const tools = toBridgeTools(activeSchemas)
     conv.toolNames = new Set(tools.map(t => t.name))
+    conv.sandboxMode = sandboxMode
+    conv.writableRoots = writableRoots
     const effort = this.effectiveEffort(options.model, asEffort(options.reasoningEffort) ?? this.defaultEffort())
-    const key = reanswerKey(options, split.system)
+    const key = reanswerKey(options, systemText)
+    const turnKey = userTurnKey(options, preparedMessages)
+    if (this.turnBudgets.get(conv)?.turnKey !== turnKey) this.turnBudgets.set(conv, { turnKey, granted: 0 })
     if (conv.reanswer.key !== key) {
       // A different request: a pending re-answer is stale, this one starts fresh.
       conv.reanswer.key = key
       conv.reanswer.granted = 0
       conv.reanswer.blocks = []
+      conv.reanswer.blocksAreReplay = false
       conv.reanswer.awaiting = false
       conv.reanswer.freshSession = false
     }
     if (conv.reanswer.awaiting) {
-      yield * this.reanswer(conv, slot, proc, options, effort, split.system, activeSchemas, tools)
+      yield * this.reanswer(conv, slot, proc, options, effort, systemText, preparedMessages, activeSchemas, tools, engineMode, effectiveCwd, sandboxMode, writableRoots)
       return
     }
 
     if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
-      if (!historyPrefixIntact(conv, split.system, split.messages)) {
+      if (!historyPrefixIntact(conv, systemText, preparedMessages)) {
         this.dropTurn(conv, 'The conversation history was compacted or rewritten; rebuilding the session from the harness history.')
       } else {
-        const resumed = await this.deliverResults(conv, slot, split.messages, proc, tools)
+        const resumed = await this.deliverResults(conv, slot, preparedMessages, proc, tools)
         if (resumed) {
-          yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(split.messages) })
+          yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(preparedMessages) })
           return
         }
         this.dropTurn(conv, 'The conversation history changed; the harness restarted this turn.')
@@ -1105,15 +1275,17 @@ export class AntigravityRuntime implements AccountAdmin {
 
     let resumedFromDisk = false
     if (conv.sessionId === undefined && !conv.dirty && conv.purpose === MAIN_PURPOSE && conv.dshSessionId !== undefined) {
-      resumedFromDisk = await this.tryResumePersistedSession(conv, slot, split.system, split.messages, activeSchemas, proc)
+      resumedFromDisk = await this.tryResumePersistedSession(conv, slot, engineMode, effectiveCwd, systemText, preparedMessages, activeSchemas, proc)
     }
 
-    const plan = planPrompt(conv, split.system, split.messages, this.host.config.provider)
+    const plan = planPrompt(conv, systemText, preparedMessages, this.host.config.provider)
     if (plan.rebuild) await this.resetSession(conv)
+    conv.sandboxMode = sandboxMode
+    conv.writableRoots = writableRoots
     const freshSession = conv.sessionId === undefined
     if (freshSession) {
-      conv.systemHash = digest(split.system)
-      await this.openSession(conv, slot, split.system, activeSchemas, tools, proc)
+      conv.systemHash = digest(systemText)
+      await this.openSession(conv, slot, engineMode, effectiveCwd, systemText, activeSchemas, tools, proc)
     }
     const switched = await this.select(conv, proc, options.model, effort)
     const settleMs = this.host.config.coldSwitchSettleMs ?? 80
@@ -1131,14 +1303,15 @@ export class AntigravityRuntime implements AccountAdmin {
       const toolDelta = consumeToolDelta(conv, tools)
       if (toolDelta.length > 0) blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
     }
-    const nextKnownIds = messageIds(split.messages)
+    const nextKnownIds = messageIds(preparedMessages)
     conv.reportedToolCalls.clear()
-    conv.turn = new AcpTurn(this.nextTurnTag(split.messages))
+    conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native')
     conv.health.beginTurn()
     // Record the request this prompt belongs to; a rebuild above (which
     // replaced the whole bookkeeping object) already cleared it.
     conv.reanswer.key = key
     conv.reanswer.blocks = blocks
+    conv.reanswer.blocksAreReplay = plan.rebuild
     conv.reanswer.awaiting = false
     conv.reanswer.freshSession = false
     if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
@@ -1150,17 +1323,24 @@ export class AntigravityRuntime implements AccountAdmin {
 
   /**
    * Re-send one request that DSH retried after a degraded attempt: continue the
-   * warm ACP session with the reroll notice, or — when the degraded attempt
-   * never completed a round in a cold session — replace it and re-send the
-   * original prompt.
+   * warm ACP session with the reroll notice, or — when the degraded attempt never
+   * completed a round in a cold session, or the same session's reroll already
+   * failed once and the fallback pool's block cache keeps matching its prefix —
+   * replace the session and re-send the original prompt (cold) or a full history
+   * replay (warm).
    * @param conv - the conversation whose bookkeeping holds the pending record.
    * @param slot - account serving this conversation.
    * @param proc - its ACP front.
    * @param options - the repeated request.
    * @param effort - resolved reasoning effort.
    * @param system - request system text.
+   * @param messages - prepared conversation messages.
    * @param activeSchemas - tools active for this step.
    * @param tools - their bridge descriptors.
+   * @param engineMode - active engine mode.
+   * @param effectiveCwd - working directory for the ACP session.
+   * @param sandboxMode - extracted file sandbox mode in `native` mode.
+   * @param writableRoots - writable roots under `workspace-write` in `native` mode.
    * @yields stream chunks of the re-answer.
    */
   private async * reanswer(
@@ -1170,47 +1350,75 @@ export class AntigravityRuntime implements AccountAdmin {
     options: GenerateOptions,
     effort: Effort,
     system: string,
+    messages: readonly RequestMessage[],
     activeSchemas: readonly ToolSchema[],
     tools: readonly BridgeTool[],
+    engineMode: EngineMode,
+    effectiveCwd: string,
+    sandboxMode: NativeSandboxMode | undefined,
+    writableRoots: readonly string[],
   ): AsyncGenerator<StreamChunk> {
     const state = conv.reanswer
+    const reanswerMessages = engineMode === 'native' ? messages : options.messages
     const fresh = state.freshSession || conv.sessionId === undefined
     const original = state.blocks
     state.awaiting = false
     state.freshSession = false
     conv.reportedToolCalls.clear()
     conv.health.beginTurn()
-    conv.turn = new AcpTurn(this.nextTurnTag(options.messages))
     let blocks: AcpPromptBlock[]
     if (fresh) {
-      // Only a session that never finished a round is replaced: its poisoned
-      // first turn cannot be continued, so the original input is re-sent.
+      // A cold session that never finished a round is replaced with its own prompt
+      // replayed verbatim; a session whose recorded blocks were incremental gets a
+      // full history replay instead, so escaping the poisoned session never loses
+      // the conversation that session was already carrying.
+      const replayEscaped = state.blocksAreReplay !== true && original.length > 0
       await this.resetSession(conv)
+      const plan = replayEscaped
+        ? planPrompt(conv, system, reanswerMessages, this.host.config.provider)
+        : undefined
       conv.reanswer.key = state.key
       conv.reanswer.granted = state.granted
       conv.reanswer.blocks = original
+      conv.reanswer.blocksAreReplay = state.blocksAreReplay
       conv.systemHash = digest(system)
       // Tag the replayed system text so the fresh session's first 2048-token block hashes
       // differently upstream: the fallback pool's prefix cache no longer matches this request.
-      await this.openSession(conv, slot, `[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas, tools, proc)
+      await this.openSession(conv, slot, engineMode, effectiveCwd, `[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas, tools, proc)
       const freshDb = sessionDbPath(slot.layout.geminiDir, conv.sessionId as string)
       this.pinUsageCursors(conv, freshDb)
       await this.select(conv, proc, options.model, effort)
-      blocks = original.length > 0 ? original : [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
+      if (plan !== undefined) {
+        const replayBudget = slot.preflight?.unlock.status === 'unlocked'
+          ? UNLOCKED_REPLAY_BUDGET_BYTES
+          : LOCKED_REPLAY_BUDGET_BYTES
+        blocks = await replayPrompt(plan.history, plan.input, this.host.readImage, replayBudget)
+        // A later replacement of this session must re-send the full replay, not the
+        // stale incremental input the replaced session was originally sent.
+        conv.reanswer.blocks = blocks
+        conv.reanswer.blocksAreReplay = true
+      } else {
+        blocks = original.length > 0 ? original : [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
+      }
     } else {
       conv.promptGen++
       await Promise.race([conv.promptSettled, delay(3_000)])
       blocks = [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
     }
+    conv.sandboxMode = sandboxMode
+    conv.writableRoots = writableRoots
+    conv.turn = new AcpTurn(this.nextTurnTag(reanswerMessages), engineMode === 'native')
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
     this.startPrompt(conv, proc, blocks)
-    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(options.messages) })
+    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(reanswerMessages) })
   }
 
   private async tryResumePersistedSession(
     conv: Conversation,
     slot: AccountSlot,
+    engineMode: EngineMode,
+    effectiveCwd: string,
     system: string,
     messages: readonly RequestMessage[],
     activeSchemas: readonly ToolSchema[],
@@ -1220,6 +1428,14 @@ export class AntigravityRuntime implements AccountAdmin {
     if (dshId === undefined) return false
     const persisted = this.sessions.get(dshId)
     if (persisted === undefined || persisted.accountId !== slot.layout.id) return false
+    if ((persisted.engineMode ?? 'bridge') !== engineMode) {
+      this.sessions.forget(dshId)
+      return false
+    }
+    if ((persisted.sessionCwd ?? slot.layout.workspace) !== effectiveCwd) {
+      this.sessions.forget(dshId)
+      return false
+    }
     if (persisted.systemHash !== digest(system)) {
       this.sessions.forget(dshId)
       return false
@@ -1251,8 +1467,11 @@ export class AntigravityRuntime implements AccountAdmin {
     conv.advertisedTools = persisted.advertisedTools.map(t => ({ ...t }))
     conv.advertisedToolNames = new Set(persisted.advertisedTools.map(t => t.name))
     conv.knownTools = new Map(persisted.knownTools)
+    conv.engineMode = engineMode
+    conv.sessionCwd = effectiveCwd
     const mount = mountBridge(conv, {
       bridgeUrl: this.bridge.url,
+      engineMode,
       system,
       toolContracts: renderFullToolContracts(activeSchemas, MAX_EAGER_BRIDGE_TOOL_BYTES),
       registerTenant: (tenantKey, tenant) => this.tenants.set(tenantKey, tenant),
@@ -1263,12 +1482,14 @@ export class AntigravityRuntime implements AccountAdmin {
     try {
       const result = await proc.loadSession({
         sessionId: persisted.acpSessionId,
-        cwd: slot.layout.workspace,
+        cwd: effectiveCwd,
         mcpServers: mount.mcpServers,
         _meta: { antigravity: { systemPrompt: { append: mount.systemAppend } } },
       }, mount.listener, 60_000)
       conv.sessionId = result.sessionId || persisted.acpSessionId
       conv.process = proc
+      conv.engineMode = engineMode
+      conv.sessionCwd = effectiveCwd
       conv.configOptions = result.configOptions ?? []
       conv.systemHash = persisted.systemHash
       conv.knownIds = [...persisted.knownIds]
@@ -1279,6 +1500,8 @@ export class AntigravityRuntime implements AccountAdmin {
       this.observeSlotCatalog(slot, result.configOptions, result.models?.availableModels)
       return true
     } catch (error) {
+      conv.engineMode = undefined
+      conv.sessionCwd = undefined
       detachBridge(conv, tenant => this.releaseTenant(tenant))
       this.sessions.forget(dshId)
       this.host.log.info(`antigravity-acp: session/load unavailable for ${persisted.acpSessionId} (${error instanceof Error ? error.message : String(error)}); falling back to session/new`)
@@ -1362,6 +1585,10 @@ export class AntigravityRuntime implements AccountAdmin {
       tenantSecret: undefined,
       sessionId: undefined,
       process: undefined,
+      engineMode: undefined,
+      sessionCwd: undefined,
+      sandboxMode: undefined,
+      writableRoots: [],
       configOptions: [],
       systemHash: undefined,
       advertisedTools: [],
@@ -1390,38 +1617,53 @@ export class AntigravityRuntime implements AccountAdmin {
     return conv
   }
 
-  private async startSlot(slot: AccountSlot): Promise<AcpProcess> {
+  private async startSlot(slot: AccountSlot, preferredCwd?: string): Promise<AcpProcess> {
     slot.state = 'starting'
     slot.error = undefined
+    const engineMode = this.engineMode()
+    slot.engineMode = engineMode
     try {
       const preflight = await this.runPreflightSlot(slot)
       await this.bridge.start()
+      const defaultWorkspace = engineMode === 'native'
+        ? (canonicalizeExistingDir(preflight.workspace) ?? preflight.workspace)
+        : preflight.workspace
+      const frontCwd = engineMode === 'native' && preferredCwd !== undefined
+        ? (canonicalizeExistingDir(preferredCwd) ?? defaultWorkspace)
+        : defaultWorkspace
+      slot.frontCwd = frontCwd
       const argv = [
         preflight.binary, 'acp',
         '--gemini-dir', preflight.home,
         '--app-data-dir', 'agy',
-        '--agent', BRIDGE_AGENT,
+        ...(engineMode === 'bridge' ? ['--agent', BRIDGE_AGENT] : []),
         '--process-per-session',
         '--disable-telemetry',
+        '--override_user_agent_name', 'antigravity',
         '--log-file', preflight.logFile,
       ]
       const proc = new AcpProcess({
         argv,
-        cwd: preflight.workspace,
+        cwd: frontCwd,
         spawn: this.host.spawnAcp,
         env: slot.env,
-        clientName: 'jetbrains.dsh',
-        clientVersion: '0.1.0',
+        clientName: ACP_CLIENT_NAME,
+        clientVersion: acpClientVersion(preflight.version),
         log: message => this.host.log.warn(message),
       })
       proc.onExit(error => this.onProcessExit(proc, error))
       await proc.start(120_000)
+      void binaryDigest(preflight.binary).then(agyDigest => this.host.log.info(
+        `antigravity-acp: [${slot.layout.id}] run plugin=${pluginBuildDigest()} agy=${preflight.version} sha256:${agyDigest ?? 'unknown'} engineMode=${engineMode} degradeAction=${this.degradeAction()} argv=${JSON.stringify(argv.slice(1))}`,
+      ))
       slot.process = proc
       slot.state = 'ready'
       slot.readyAt = Date.now()
       this.lastError = undefined
       return proc
     } catch (error) {
+      slot.engineMode = undefined
+      slot.frontCwd = undefined
       slot.state = 'error'
       slot.error = error instanceof Error ? error.message : String(error)
       this.lastError = slot.error
@@ -1462,6 +1704,8 @@ export class AntigravityRuntime implements AccountAdmin {
     for (const slot of this.slots.values()) {
       if (slot.process !== proc) continue
       slot.process = undefined
+      slot.engineMode = undefined
+      slot.frontCwd = undefined
       if (!this.disposed) {
         slot.state = 'error'
         slot.error = error.message
@@ -1481,6 +1725,10 @@ export class AntigravityRuntime implements AccountAdmin {
       this.releaseTenant(conv)
       conv.sessionId = undefined
       conv.process = undefined
+      conv.engineMode = undefined
+      conv.sessionCwd = undefined
+      conv.sandboxMode = undefined
+      conv.writableRoots = []
       conv.tenantKey = undefined
       conv.tenantSecret = undefined
       conv.advertisedTools = []
@@ -1499,6 +1747,8 @@ export class AntigravityRuntime implements AccountAdmin {
   private async openSession(
     conv: Conversation,
     slot: AccountSlot,
+    engineMode: EngineMode,
+    effectiveCwd: string,
     system: string,
     activeSchemas: readonly ToolSchema[],
     tools: readonly BridgeTool[],
@@ -1509,8 +1759,11 @@ export class AntigravityRuntime implements AccountAdmin {
     conv.advertisedTools = [...tools]
     conv.advertisedToolNames = new Set(tools.map(t => t.name))
     conv.knownTools = new Map(tools.map(t => [t.name, digest(t)]))
+    conv.engineMode = engineMode
+    conv.sessionCwd = effectiveCwd
     const mount = mountBridge(conv, {
       bridgeUrl: this.bridge.url,
+      engineMode,
       system,
       toolContracts: renderFullToolContracts(activeSchemas, MAX_EAGER_BRIDGE_TOOL_BYTES),
       registerTenant: (tenantKey, tenant) => this.tenants.set(tenantKey, tenant),
@@ -1520,12 +1773,14 @@ export class AntigravityRuntime implements AccountAdmin {
     })
     try {
       const result = await proc.newSession({
-        cwd: slot.layout.workspace,
+        cwd: effectiveCwd,
         mcpServers: mount.mcpServers,
         _meta: { antigravity: { systemPrompt: { append: mount.systemAppend } } },
       }, mount.listener, 120_000)
       conv.sessionId = result.sessionId
       conv.process = proc
+      conv.engineMode = engineMode
+      conv.sessionCwd = effectiveCwd
       conv.configOptions = result.configOptions ?? []
       conv.model = undefined
       conv.effort = undefined
@@ -1534,6 +1789,8 @@ export class AntigravityRuntime implements AccountAdmin {
       conv.issuedIds.clear()
       this.observeSlotCatalog(slot, result.configOptions, result.models?.availableModels)
     } catch (error) {
+      conv.engineMode = undefined
+      conv.sessionCwd = undefined
       detachBridge(conv, tenant => this.releaseTenant(tenant))
       throw mapError(error)
     }
@@ -1563,6 +1820,7 @@ export class AntigravityRuntime implements AccountAdmin {
     return decidePermission(permissionState(conv), request, {
       hasHandshake: tenantKey => this.bridge.hasHandshake(tenantKey),
       warn: message => this.host.log.warn(message),
+      onNativeBuiltinRejected: denial => conv.turn?.noteNativeDenial(denial),
     })
   }
 
@@ -1586,6 +1844,10 @@ export class AntigravityRuntime implements AccountAdmin {
     conv.tenantKey = undefined
     conv.tenantSecret = undefined
     conv.process = undefined
+    conv.engineMode = undefined
+    conv.sessionCwd = undefined
+    conv.sandboxMode = undefined
+    conv.writableRoots = []
     conv.advertisedTools = []
     conv.advertisedToolNames.clear()
     conv.knownTools.clear()
@@ -1720,7 +1982,9 @@ export class AntigravityRuntime implements AccountAdmin {
     ctx: PumpContext,
   ): AsyncGenerator<StreamChunk> {
     const turn = conv.turn as AcpTurn
-    const holdZeroThoughtText = conv.purpose === MAIN_PURPOSE && /argon/i.test(options.model) && effort === 'high'
+    // Text is held only while a verdict could still refuse it; observation never refuses.
+    const holdZeroThoughtText = conv.purpose === MAIN_PURPOSE && isGemini4Flagship(options.model) && effort === 'high'
+      && this.degradeAction() !== 'observe'
     let finishKind: string | undefined
     try {
       for await (const chunk of pumpStep(turn, {
@@ -1728,6 +1992,10 @@ export class AntigravityRuntime implements AccountAdmin {
         maxContinuations: this.longDecodeContinuations(),
         holdZeroThoughtText,
         continuePrompt: () => proc.prompt(conv.sessionId as string, [{ type: 'text', text: CONTINUE_PROMPT }]),
+        continueAfterPermissionDenial: denials => proc.prompt(
+          conv.sessionId as string,
+          [{ type: 'text', text: formatPermissionDenialContinuation(denials, conv.sessionCwd) }],
+        ),
         cancel: () => {
           if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
         },
@@ -1735,7 +2003,7 @@ export class AntigravityRuntime implements AccountAdmin {
           this.lastTurn = { model: options.model, effort, steps, ...usage !== undefined ? { usage } : {}, at: new Date().toISOString() }
         },
         verifyEndTurn: async () => {
-          if (conv.purpose !== MAIN_PURPOSE || !/argon/i.test(options.model) || conv.sessionId === undefined) {
+          if (conv.purpose !== MAIN_PURPOSE || !isGemini4Flagship(options.model) || conv.sessionId === undefined) {
             return 'ok'
           }
           const dbPath = sessionDbPath(slot.layout.geminiDir, conv.sessionId)
@@ -1748,15 +2016,20 @@ export class AntigravityRuntime implements AccountAdmin {
             isInterceptable: false,
           })
           if (verdict?.degraded !== true) return 'ok'
-          conv.health.noteDegradedAttempt(verdict, options.model)
-          if (conv.reanswer.granted >= MAX_REANSWERS_PER_REQUEST) {
+          // A verdict outside the intervention level is recorded (the end-of-turn
+          // read already counts it as this turn's hit) and the answer is delivered.
+          if (!this.intervenes(verdict)) return 'ok'
+          if (!this.spendReanswer(conv)) {
             // The budget is spent: deliver this degraded answer as it is.
+            this.host.log.warn(`antigravity-acp: re-answer budget spent for ${conv.key}; delivering the flagged answer (${describeVerdict(verdict)})`)
             return 'ok'
           }
-          conv.health.interceptedSteps += 1
-          conv.reanswer.granted += 1
-          conv.reanswer.awaiting = true
-          conv.reanswer.freshSession = false
+          conv.health.noteDegradedAttempt(verdict, options.model)
+          this.host.log.warn(`antigravity-acp: refusing a flagged ${options.model} answer in ${conv.key} and re-asking (${describeVerdict(verdict)})`)
+          // The same-session reroll already failed once: the fallback pool's block-quantized
+          // prefix cache keeps matching this session's prefix, so the next re-answer must
+          // escape into a fresh tagged session instead of continuing in place.
+          conv.reanswer.freshSession = conv.reanswer.granted >= SAME_SESSION_REANSWERS
           // The refused answer is never delivered, so its usage is never reported.
           turn.discardStagedUsage()
           return 'degrade'
@@ -1890,15 +2163,16 @@ export class AntigravityRuntime implements AccountAdmin {
     if (turn.finished || !this.isTurnLive(turn)) {
       const transcript = renderTranscript(pending.map(call => results.get(call.id) as RequestMessage))
       conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(this.nextTurnTag(messages))
+      conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native')
       if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
       this.startPrompt(conv, proc, [{ type: 'text', text: `${transcript}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.` }])
       return true
     }
     for (const [index, call] of pending.entries()) {
       const message = results.get(call.id) as Extract<RequestMessage, { role: 'tool' }>
-      const result = await this.toBridgeResult(message.content, message.isError === true)
-      if (index === pending.length - 1 && suffix.length > 0) result.content.push({ type: 'text', text: `\n\n${suffix}` })
+      const tail = index === pending.length - 1 && suffix.length > 0 ? `\n\n${suffix}` : ''
+      const result = await this.toBridgeResult(call.name, message.content, message.isError === true, Buffer.byteLength(tail, 'utf8'))
+      if (tail.length > 0) result.content.push({ type: 'text', text: tail })
       call.result.resolve(result)
     }
     return true
@@ -1909,7 +2183,18 @@ export class AntigravityRuntime implements AccountAdmin {
     return head?.kind !== 'done' && head?.kind !== 'error'
   }
 
-  private async toBridgeResult(content: readonly ContentBlock[], isError: boolean): Promise<BridgeToolResult> {
+  /**
+   * Convert one DSH tool result into MCP content whose text stays within
+   * `MAX_BRIDGE_RESULT_BYTES`, so `agy`'s own output truncation never cuts the
+   * middle out of it.
+   * @param toolName - DSH tool name, which selects the bounding strategy.
+   * @param content - DSH result blocks.
+   * @param isError - whether the tool failed.
+   * @param reservedBytes - UTF-8 bytes the caller appends afterwards (a tool delta or steering suffix);
+   * a suffix over three quarters of the ceiling is kept whole and can carry the result past it.
+   * @returns the bridge result.
+   */
+  private async toBridgeResult(toolName: string, content: readonly ContentBlock[], isError: boolean, reservedBytes = 0): Promise<BridgeToolResult> {
     const items: BridgeContent[] = []
     for (const block of content) {
       if (block.type === 'text') {
@@ -1924,7 +2209,7 @@ export class AntigravityRuntime implements AccountAdmin {
       }
     }
     if (items.length === 0) items.push({ type: 'text', text: '(no output)' })
-    return { content: items, ...isError ? { isError: true } : {} }
+    return { content: boundBridgeContent(toolName, items, reservedBytes, isError), ...isError ? { isError: true } : {} }
   }
 
   private dropTurn(conv: Conversation, reason: string): void {
@@ -1980,7 +2265,7 @@ export class AntigravityRuntime implements AccountAdmin {
       conv.purpose !== MAIN_PURPOSE
       || conv.sessionId === undefined
       || conv.accountId === undefined
-      || !/argon/i.test(conv.model ?? '')
+      || !isGemini4Flagship(conv.model ?? '')
     ) {
       return undefined
     }
@@ -2004,29 +2289,74 @@ export class AntigravityRuntime implements AccountAdmin {
     if (verdict?.degraded !== true) return undefined
     if (signal.aborted) return { content: [{ type: 'text', text: 'The tool call was cancelled.' }], isError: true }
 
+    // Speed, cache-granularity, and thinking-depth signals are evidence about the
+    // route, not about this tool call: outside the intervention level, or once the
+    // user turn's re-answer budget is spent, the call goes to the harness, whose own
+    // permissions and approvals still apply, and the verdict stays on record.
+    if (!this.intervenes(verdict) || !this.spendReanswer(conv)) {
+      conv.health.recordDeliveredHit(verdict, model)
+      if (this.intervenes(verdict)) {
+        this.host.log.warn(`antigravity-acp: re-answer budget spent for ${conv.key}; handing the flagged tool call to the harness (${describeVerdict(verdict)})`)
+      }
+      return undefined
+    }
     conv.health.noteDegradedAttempt(verdict, model)
+    this.host.log.warn(`antigravity-acp: refusing a flagged ${model} tool call in ${conv.key} and re-asking (${describeVerdict(verdict)})`)
     // The refused generation is never delivered, so its usage is never reported.
     turn.discardStagedUsage()
-    const exhausted = conv.reanswer.granted >= MAX_REANSWERS_PER_REQUEST
-    if (!exhausted) {
-      conv.health.interceptedSteps += 1
-      conv.reanswer.granted += 1
-      conv.reanswer.awaiting = true
-      // Only a cold session that never finished a round cannot be continued in
-      // place once its turn was cancelled mid-tool-call.
-      conv.reanswer.freshSession = conv.reanswer.rounds === 0 && turn.toolSteps === 0
-    }
+    // Only a cold session that never finished a round cannot be continued in
+    // place once its turn was cancelled mid-tool-call; a reroll that already failed
+    // once escapes too, because the fallback pool's block cache keeps matching the prefix.
+    conv.reanswer.freshSession = (conv.reanswer.rounds === 0 && turn.toolSteps === 0)
+      || conv.reanswer.granted >= SAME_SESSION_REANSWERS
     if (conv.sessionId !== undefined) conv.process?.cancel(conv.sessionId)
-    turn.events.push({ kind: 'error', error: exhausted ? degradedExhaustedError() : degradedRouteError() })
+    turn.events.push({ kind: 'error', error: degradedRouteError() })
     return {
       content: [{
         type: 'text',
-        text: exhausted
-          ? 'Upstream kept routing this attempt to a degraded fallback node; the harness aborted the step and this tool call was NOT executed.'
-          : 'Upstream routed this attempt to a degraded fallback node; the harness is re-answering the same request, so this tool call was NOT executed and no state changed.',
+        text: 'The harness is re-answering this request, so this tool call was NOT executed and no state changed.',
       }],
       isError: true,
     }
+  }
+
+  /**
+   * Live intervention level of the route-health fingerprint: the settings-card
+   * override, then the volatile config field, then `truncation`.
+   * @returns the level the next verdict is judged against.
+   */
+  degradeAction(): DegradeAction {
+    return this.overrides.degradeAction ?? asDegradeAction(current(this.host.config.degradeAction)) ?? 'truncation'
+  }
+
+  /**
+   * Whether a degraded verdict may refuse the answer or tool call it judged.
+   * @param verdict - the degraded fingerprint.
+   * @returns true when the configured intervention level covers this verdict.
+   */
+  private intervenes(verdict: DegradeFingerprintResult): boolean {
+    if (!verdict.degraded) return false
+    const action = this.degradeAction()
+    if (action === 'observe') return false
+    if (action === 'legacy') return true
+    return verdict.signals.some(signal => signal.kind === 'context_truncated')
+  }
+
+  /**
+   * Spend one automatic re-answer from both the request budget and the user-turn
+   * budget, and mark the conversation as awaiting the harness retry.
+   * @param conv - the conversation whose attempt is being refused.
+   * @returns false, spending nothing, when either budget is already exhausted.
+   */
+  private spendReanswer(conv: Conversation): boolean {
+    const budget = this.turnBudgets.get(conv)
+    if (conv.reanswer.granted >= MAX_REANSWERS_PER_REQUEST) return false
+    if (budget !== undefined && budget.granted >= MAX_REANSWERS_PER_USER_TURN) return false
+    if (budget !== undefined) budget.granted += 1
+    conv.health.interceptedSteps += 1
+    conv.reanswer.granted += 1
+    conv.reanswer.awaiting = true
+    return true
   }
 
   private async callTool(request: BridgeCallRequest): Promise<BridgeToolResult> {
@@ -2112,6 +2442,8 @@ export class AntigravityRuntime implements AccountAdmin {
       if (now - Math.max(this.pool.lastUsed(slot.layout.id), slot.readyAt) < ttl) continue
       slot.process.stop()
       slot.process = undefined
+      slot.engineMode = undefined
+      slot.frontCwd = undefined
       slot.state = 'idle'
     }
   }
@@ -2256,6 +2588,36 @@ function isQuotaFailure(error: unknown): boolean {
  * @param system - its system text.
  * @returns the opaque key.
  */
+/**
+ * Identity of the user turn one request belongs to: every step that answers the
+ * same latest user message shares it, a new user message starts a new one.
+ * @param options - the request.
+ * @param messages - its history without the system prompt.
+ * @returns purpose, model, and the id of the latest user message.
+ */
+function userTurnKey(options: GenerateOptions, messages: readonly RequestMessage[]): string {
+  let lastUser = ''
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index] as RequestMessage
+    if (message.role === 'user') { lastUser = String(message.id ?? ''); break }
+  }
+  return `${String((options as { purpose?: string }).purpose ?? '')}|${options.model}|${lastUser}`
+}
+
+/**
+ * ACP `clientInfo.version` derived from the `agy --version` text.
+ * @param version - version text reported by the preflight.
+ * @returns its `major.minor.patch`, or the fallback version when it carries none.
+ */
+export function acpClientVersion(version: string): string {
+  return /(\d+\.\d+\.\d+)/u.exec(version)?.[1] ?? FALLBACK_ACP_CLIENT_VERSION
+}
+
+/** Compact signal list for logs, e.g. `score 4: fast_decode+2, block_cache+2`. */
+function describeVerdict(verdict: DegradeFingerprintResult): string {
+  return `score ${verdict.score}: ${verdict.signals.map(signal => `${signal.kind}+${signal.points}`).join(', ') || 'no signals'}`
+}
+
 function reanswerKey(options: GenerateOptions, system: string): string {
   return `${String((options as { purpose?: string }).purpose ?? '')}|${options.model}|${digest(system)}|${messageIds(options.messages).join(',')}`
 }
@@ -2318,6 +2680,49 @@ function resetTimeFromError(error: unknown): string | undefined {
   if (absolute !== undefined) return absolute
   const delayMs = retryAfterMsFromError(error)
   return delayMs === undefined ? undefined : new Date(Date.now() + delayMs).toISOString()
+}
+
+function canonicalizeExistingDir(dir: string | undefined): string | undefined {
+  if (dir === undefined || dir.length === 0) return undefined
+  try {
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) return undefined
+    try {
+      return realpathSync(dir)
+    } catch {
+      return dir
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function formatPermissionDenialContinuation(
+  denials: readonly NativePermissionDenial[],
+  sessionCwd: string | undefined,
+): string {
+  const mode = denials[0]?.sandboxMode ?? 'workspace-write'
+  const summary = denials.map(d => `${d.tool} (${d.reason})`).join('; ')
+  const guidance = mode === 'read-only'
+    ? 'This session is in read-only mode: file modifications and shell commands are disabled. Use only read/search tools (or allowed `mcp_dsh_*` tools) and answer the user directly.'
+    : `This session is in workspace-write mode: file modifications are restricted to the session workspace${sessionCwd !== undefined ? ` (\`${sessionCwd}\`)` : ''} and configured writable roots. Do not write outside those directories; stay within the workspace or explain the restriction to the user.`
+  return `[HARNESS_SANDBOX_NOTICE] Native tool call refused by DSH sandbox policy: ${summary}. ${guidance}`
+}
+
+function buildWritableRoots(effectiveCwd: string, sessionContext: NativeSessionContext): string[] {
+  const candidates: (string | undefined)[] = [
+    effectiveCwd,
+    sessionContext.workspaceRoot,
+    ...(sessionContext.additionalWritableRoots ?? []),
+    tmpdir(),
+    ...(process.platform === 'win32' ? [] : ['/tmp', '/private/tmp']),
+  ]
+  const roots: string[] = []
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim().length > 0 && !roots.includes(candidate)) {
+      roots.push(candidate)
+    }
+  }
+  return roots
 }
 
 function messageIds(messages: readonly RequestMessage[]): string[] {

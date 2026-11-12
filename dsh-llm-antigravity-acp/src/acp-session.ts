@@ -14,9 +14,9 @@ import { randomBytes } from 'node:crypto'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { RequestMessage } from '@deepseek-ai/dsh-llm'
 import type { AcpConfigOption, AcpPermissionOutcome, AcpPermissionRequest, AcpProcess, AcpSessionListener } from './acp-process.ts'
-import type { Effort } from './config.ts'
+import type { Effort, EngineMode } from './config.ts'
 import type { AcpTurn } from './conversation.ts'
-import { bridgeSystemPrompt, MCP_SERVER_NAME, type AcpPromptBlock } from './history.ts'
+import { bridgeSystemPrompt, MCP_SERVER_NAME, nativeBridgeSystemPrompt, type AcpPromptBlock, type NativeSandboxMode } from './history.ts'
 import { labeled } from './labels.ts'
 import type { BridgeTool } from './mcp-bridge.ts'
 import type { RouteHealth } from './route-health.ts'
@@ -39,6 +39,14 @@ export interface Conversation {
   tenantSecret: string | undefined
   sessionId: string | undefined
   process: AcpProcess | undefined
+  /** Engine mode this ACP session was opened with (`'bridge'` or `'native'`). */
+  engineMode: EngineMode | undefined
+  /** Working directory this ACP session was bound to on `session/new` or `session/load`. */
+  sessionCwd: string | undefined
+  /** File sandbox mode extracted from `runtime-context` for native built-in tool checks. */
+  sandboxMode: NativeSandboxMode | undefined
+  /** Writable roots allowed under `workspace-write` for native built-in edit tools. */
+  writableRoots: readonly string[]
   configOptions: AcpConfigOption[]
   systemHash: string | undefined
   advertisedTools: BridgeTool[]
@@ -97,6 +105,8 @@ export interface ReanswerState {
   key: string | undefined
   /** Prompt blocks of that request, replayed verbatim when a cold session is replaced. */
   blocks: AcpPromptBlock[]
+  /** Whether {@link blocks} replay the full harness history (a rebuild request) or carry only incremental input. */
+  blocksAreReplay: boolean
   /** Automatic re-answers already granted for this key. */
   granted: number
   /** The last attempt degraded; the next request with the same key re-answers instead of answering. */
@@ -107,7 +117,7 @@ export interface ReanswerState {
 
 /** Fresh bookkeeping for one ACP session. */
 export function freshReanswer(): ReanswerState {
-  return { rounds: 0, key: undefined, blocks: [], granted: 0, awaiting: false, freshSession: false }
+  return { rounds: 0, key: undefined, blocks: [], blocksAreReplay: false, granted: 0, awaiting: false, freshSession: false }
 }
 
 /** Snapshot the conflict, identity, and liveness facts the permission gate reads. */
@@ -116,6 +126,10 @@ export function permissionState(conv: Conversation): PermissionGateState {
     sessionId: conv.sessionId,
     tenantKey: conv.tenantKey,
     turnLive: conv.turn !== undefined && !conv.turn.finished,
+    engineMode: conv.engineMode ?? 'bridge',
+    sandboxMode: conv.sandboxMode,
+    sessionCwd: conv.sessionCwd,
+    writableRoots: conv.writableRoots,
     reportedToolCalls: conv.reportedToolCalls,
     advertisedToolNames: conv.advertisedToolNames,
   }
@@ -217,7 +231,9 @@ export interface BridgeMount {
 export interface BridgeMountPort {
   /** Base URL of the shared MCP bridge; the tenant key is appended per session. */
   bridgeUrl: string
-  /** Request system text. */
+  /** Active ACP engine mode (`'bridge'` or `'native'`). */
+  engineMode?: EngineMode
+  /** Request system text (full DSH system prompt in `bridge`, lifted `rulesText` in `native`). */
   system: string
   /** Rendered tool contracts appended to the agent system prompt. */
   toolContracts: string
@@ -259,7 +275,11 @@ export function mountBridge(conv: Conversation, port: BridgeMountPort): BridgeMo
     },
     onPermission: request => port.permission(request),
   }
-  return { mcpServers, systemAppend: bridgeSystemPrompt(port.system, port.toolContracts), listener }
+  const mode = port.engineMode ?? conv.engineMode ?? 'bridge'
+  const systemAppend = mode === 'native'
+    ? nativeBridgeSystemPrompt(port.system, port.toolContracts, conv.sessionCwd)
+    : bridgeSystemPrompt(port.system, port.toolContracts)
+  return { mcpServers, systemAppend, listener }
 }
 
 /**
@@ -285,10 +305,59 @@ export interface SelectionPort {
   fail(error: unknown): Error
 }
 
+/** Writes per option: the first switch, plus one retry when the read-back still differs. */
+const CONFIG_CONFIRM_ATTEMPTS = 2
+
+function configOption(options: readonly AcpConfigOption[], kind: string): AcpConfigOption | undefined {
+  return options.find(o => o.id === kind || o.category === kind)
+}
+
+/**
+ * Value the agent reports for one option. A missing `currentValue` means the
+ * agent did not report the option, so the conversation cache is the fallback.
+ */
+function reportedValue(option: AcpConfigOption | undefined, cached: string | undefined): string | undefined {
+  return option?.currentValue !== undefined ? option.currentValue : cached
+}
+
+/**
+ * Switch one option until `configOptions` reports `target`. A read-back that
+ * already matches is left untouched. A write whose read-back reports another
+ * value is repeated once; the step then fails without recording `target`.
+ * @returns whether a write was issued.
+ */
+async function confirmConfigOption(
+  conv: Conversation,
+  proc: AcpProcess,
+  sessionId: string,
+  kind: string,
+  target: string,
+  cached: string | undefined,
+  configId: string,
+  port: SelectionPort,
+): Promise<boolean> {
+  if (reportedValue(configOption(conv.configOptions, kind), cached) === target) return false
+  let option = configOption(conv.configOptions, kind)
+  let id = option?.id ?? configId
+  for (let attempt = 0; attempt < CONFIG_CONFIRM_ATTEMPTS; attempt++) {
+    conv.configOptions = await proc.setConfigOption(sessionId, id, target).catch((error: unknown) => { throw port.fail(error) })
+    option = configOption(conv.configOptions, kind)
+    // An agent that does not report the option cannot confirm it either way; only a
+    // reported value that differs is a failed switch.
+    if (option?.currentValue === undefined || option.currentValue === target) return true
+    if (option?.id !== undefined) id = option.id
+  }
+  const actual = option?.currentValue === undefined ? 'undefined' : option.currentValue
+  throw new LlmError(
+    labeled('INVALID_MODEL_CONFIG', `Antigravity kept ${kind} at "${actual}" after switching to "${target}"`),
+    'INVALID_MODEL_CONFIG',
+  )
+}
+
 /**
  * Point the ACP session at the requested model and reasoning level. agy replaces
- * the whole option list on each switch, so every step re-reads it and retries
- * once when the value did not stick.
+ * the whole option list on each switch, so every step re-reads it. The read-back
+ * `currentValue` is authoritative and is recorded only when it equals the request.
  * @param conv - conversation bound to the session.
  * @param proc - its ACP front.
  * @param model - requested model id.
@@ -304,30 +373,18 @@ export async function applyModelAndEffort(
   port: SelectionPort,
 ): Promise<boolean> {
   const sessionId = conv.sessionId as string
-  let switched = false
-  let modelOption = conv.configOptions.find(o => o.id === 'model' || o.category === 'model')
+  const modelOption = configOption(conv.configOptions, 'model')
   if (modelOption?.options !== undefined && !modelOption.options.some(o => o.value === model)) {
     throw new LlmError(labeled('UNKNOWN_MODEL', `Antigravity does not offer model "${model}" to this account; available: ${modelOption.options.map(o => o.value).join(', ')}`), 'UNKNOWN_MODEL')
   }
-  if (conv.model !== model && modelOption?.currentValue !== model) {
-    conv.configOptions = await proc.setConfigOption(sessionId, modelOption?.id ?? 'model', model).catch((error: unknown) => { throw port.fail(error) })
-    switched = true
-    modelOption = conv.configOptions.find(o => o.id === 'model' || o.category === 'model')
-    if (modelOption !== undefined && modelOption.currentValue !== undefined && modelOption.currentValue !== model) {
-      conv.configOptions = await proc.setConfigOption(sessionId, modelOption.id, model).catch((error: unknown) => { throw port.fail(error) })
-    }
+  const modelSwitched = await confirmConfigOption(conv, proc, sessionId, 'model', model, conv.model, modelOption?.id ?? 'model', port)
+  const levelOption = configOption(conv.configOptions, 'thought_level')
+  const selectable = port.selectableEfforts(model)
+  let levelSwitched = false
+  if (selectable.length > 0 && levelOption !== undefined) {
+    levelSwitched = await confirmConfigOption(conv, proc, sessionId, 'thought_level', effort, conv.effort, levelOption.id, port)
   }
   conv.model = model
-  let levelOption = conv.configOptions.find(o => o.id === 'thought_level' || o.category === 'thought_level')
-  const selectable = port.selectableEfforts(model)
-  if (selectable.length > 0 && levelOption !== undefined && conv.effort !== effort && levelOption.currentValue !== effort) {
-    conv.configOptions = await proc.setConfigOption(sessionId, levelOption.id, effort).catch((error: unknown) => { throw port.fail(error) })
-    switched = true
-    levelOption = conv.configOptions.find(o => o.id === 'thought_level' || o.category === 'thought_level')
-    if (levelOption !== undefined && levelOption.currentValue !== undefined && levelOption.currentValue !== effort) {
-      conv.configOptions = await proc.setConfigOption(sessionId, levelOption.id, effort).catch((error: unknown) => { throw port.fail(error) })
-    }
-  }
   conv.effort = effort
-  return switched
+  return modelSwitched || levelSwitched
 }

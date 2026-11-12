@@ -57,7 +57,7 @@ test('normalizeSubscriptionTier and parseLoadCodeAssist prioritize paidTier and 
   assert.equal(free.subscriptionTier, 'FREE')
 })
 
-test('Ultra account shares Gemini pool with Argon and exposes Claude 5.5 + Argon', () => {
+test('Ultra account shares Gemini pool with Carbon + Argon and exposes Claude 5.5 + Argon', () => {
   const summaryGroups = [
     {
       displayName: 'Gemini Models',
@@ -81,6 +81,7 @@ test('Ultra account shares Gemini pool with Argon and exposes Claude 5.5 + Argon
       displayName: 'Recommended',
       groups: [{
         modelIds: [
+          'gemini-4-carbon-medium', 'gemini-4-carbon-high', 'gemini-4-carbon-low',
           'gemini-4-argon-medium', 'gemini-4-argon-high', 'gemini-4-argon-low',
           'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low',
           'claude-opus-5-5-low', 'claude-opus-5-5-medium', 'claude-opus-5-5-high',
@@ -90,6 +91,9 @@ test('Ultra account shares Gemini pool with Argon and exposes Claude 5.5 + Argon
       }],
     }],
     models: {
+      'gemini-4-carbon-medium': { displayName: 'Gemini 4 Carbon (Medium)', maxTokens: 1048576 },
+      'gemini-4-carbon-high': { displayName: 'Gemini 4 Carbon (High)', maxTokens: 1048576 },
+      'gemini-4-carbon-low': { displayName: 'Gemini 4 Carbon (Low)', maxTokens: 1048576 },
       'gemini-4-argon-medium': { displayName: 'Gemini 4 Argon (Medium)', maxTokens: 1048576 },
       'gemini-4-argon-high': { displayName: 'Gemini 4 Argon (High)', maxTokens: 1048576 },
       'gemini-4-argon-low': { displayName: 'Gemini 4 Argon (Low)', maxTokens: 1048576 },
@@ -109,22 +113,26 @@ test('Ultra account shares Gemini pool with Argon and exposes Claude 5.5 + Argon
   const derived = deriveAccountModels(fetchAvailable, summaryGroups, 'ULTRA')
   assert.equal(derived.argonEligible, true)
   assert.deepEqual(derived.models.map(m => m.id), [
+    'gemini-4-carbon',
     'gemini-4-argon',
     'gemini-3.8-flash',
     'claude-opus-5-5',
     'claude-sonnet-5-5',
     'gpt-oss-120b-medium',
   ])
+  assert.deepEqual(derived.effortsByModel['gemini-4-carbon'], ['low', 'medium', 'high'])
   assert.deepEqual(derived.effortsByModel['gemini-4-argon'], ['low', 'medium', 'high'])
   assert.deepEqual(derived.effortsByModel['gpt-oss-120b-medium'], [])
+  assert.equal(derived.maxTokensByModel['gemini-4-carbon'], 1048576)
 
   const normalized = normalizeCloudCodeQuotaGroups(summaryGroups, derived.models, derived.rawModels, 'ULTRA', derived.argonEligible)
   assert.equal(normalized.argonSharedWithGemini, true)
   assert.equal(normalized.groups.length, 2)
-  assert.equal(normalized.groups[0].name, 'Gemini 4 Argon / 3.8')
+  assert.equal(normalized.groups[0].name, 'Gemini 4 Carbon / Argon / 3.8')
   assert.equal(normalized.groups[1].name, 'Claude 5.5 / GPT')
   assert.equal(normalized.groups[1].buckets.find(b => b.id === '3p-5h').disabled, true, 'exhausted 3p-weekly disables 3p-5h')
-  assert.equal(groupForModel(normalized.groups, 'gemini-4-argon').name, 'Gemini 4 Argon / 3.8')
+  assert.equal(groupForModel(normalized.groups, 'gemini-4-carbon').name, 'Gemini 4 Carbon / Argon / 3.8')
+  assert.equal(groupForModel(normalized.groups, 'gemini-4-argon').name, 'Gemini 4 Carbon / Argon / 3.8')
 })
 
 test('Standard Pro account with dedicated Argon weekly bucket keeps Argon separate from Gemini 3.8', () => {
@@ -187,7 +195,7 @@ test('Standard Pro account with dedicated Argon weekly bucket keeps Argon separa
   assert.equal(groupForModel(normalized.groups, 'gemini-3.8-flash').buckets[0].remainingFraction, 0.9)
 })
 
-test('Jio / Student Pro account without Argon or Claude 5.5 reports Claude 4.6 and marks Argon disabled', () => {
+test('Jio / Student Pro account without Carbon or Argon reports Claude 4.6 and marks both disabled', () => {
   const summaryGroups = [
     {
       displayName: 'Gemini Models',
@@ -216,6 +224,7 @@ test('Jio / Student Pro account without Argon or Claude 5.5 reports Claude 4.6 a
           'claude-opus-4-6-thinking',
           'gpt-oss-120b-medium',
           'gemini-4-argon-disabled',
+          'gemini-4-carbon-disabled',
         ],
       }],
     }],
@@ -227,13 +236,14 @@ test('Jio / Student Pro account without Argon or Claude 5.5 reports Claude 4.6 a
       'claude-opus-4-6-thinking': { displayName: 'Claude Opus 4.6 (Thinking)', maxTokens: 250000 },
       'gpt-oss-120b-medium': { displayName: 'GPT-OSS 120B (Medium)', maxTokens: 131072 },
       'gemini-4-argon-disabled': { displayName: 'Gemini 4 Argon', disabled: true, maxTokens: 1048576 },
+      'gemini-4-carbon-disabled': { displayName: 'Gemini 4 Carbon', disabled: true, maxTokens: 1048576 },
     },
   }
 
   assert.equal(checkArgonEligibility(summaryGroups, [], 'PRO'), false)
   const derived = deriveAccountModels(fetchAvailable, summaryGroups, 'PRO')
   assert.equal(derived.argonEligible, false)
-  assert.deepEqual(derived.disabledModels, ['gemini-4-argon'])
+  assert.deepEqual(derived.disabledModels, ['gemini-4-argon', 'gemini-4-carbon'])
   assert.deepEqual(derived.models.map(m => m.id), [
     'gemini-3.8-flash',
     'claude-sonnet-4-6',

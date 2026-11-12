@@ -6,7 +6,7 @@
  */
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
 import { SYSTEM_ACCOUNT_LABEL } from "./accounts.js";
-import { asEffort } from "./config.js";
+import { asDegradeAction, asEffort, asEngineMode } from "./config.js";
 /** Package name used for Typert descriptor identities. */
 export const PACKAGE_NAME = 'dsh-llm-antigravity-acp';
 /** Cordis service key and wire namespace. */
@@ -176,10 +176,10 @@ export function parseConfigureRequest(value) {
             throw new TypeError('Invalid antigravity modelDisplayNames');
         }
         out.modelDisplayNames = Object.create(null);
-        for (const [id, value] of Object.entries(names)) {
+        for (const [id, alias] of Object.entries(names)) {
             if (!id.trim() || id.length > 200)
                 throw new TypeError('Invalid antigravity model display name id');
-            const name = displayName(value);
+            const name = displayName(alias);
             if (name)
                 out.modelDisplayNames[id] = name;
         }
@@ -206,6 +206,18 @@ export function parseConfigureRequest(value) {
             throw new TypeError('Invalid antigravity longDecodeContinuations');
         }
         out.longDecodeContinuations = record.longDecodeContinuations;
+    }
+    if (record.degradeAction !== undefined) {
+        const action = asDegradeAction(record.degradeAction);
+        if (action === undefined)
+            throw new TypeError('Invalid antigravity degradeAction');
+        out.degradeAction = action;
+    }
+    if (record.engineMode !== undefined) {
+        const mode = asEngineMode(record.engineMode);
+        if (mode === undefined)
+            throw new TypeError('Invalid antigravity engineMode');
+        out.engineMode = mode;
     }
     if (record.visibleModels !== undefined)
         out.visibleModels = parseVisibleModels(record.visibleModels, 'Invalid antigravity configure request.visibleModels');
@@ -397,7 +409,6 @@ export class AntigravityRemote extends TypertRemoteService {
         const patch = parseConfigureRequest(request);
         const settings = this.ctx.get('settings');
         // Alias edits must not look saved when the profile refused persistence.
-        // Store these presentation-only fields before applying their live override.
         const aliases = {
             ...patch.displayName !== undefined ? { displayName: patch.displayName } : {},
             ...patch.modelDisplayNames !== undefined ? { modelDisplayNames: patch.modelDisplayNames } : {},

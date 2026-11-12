@@ -10,6 +10,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { asEngineMode } from "./config.js";
 /** Maximum durable DSH -> ACP session bindings retained in `session-index.json`. */
 const MAX_PERSISTED_SESSIONS = 128;
 /** Reader and writer of the session index file. */
@@ -64,9 +65,13 @@ export class SessionStore {
                     || typeof rec['systemHash'] !== 'string'
                     || !Array.isArray(rec['knownIds']))
                     continue;
+                const engineMode = asEngineMode(rec['engineMode']);
+                const sessionCwd = typeof rec['sessionCwd'] === 'string' && rec['sessionCwd'].length > 0 ? rec['sessionCwd'] : undefined;
                 this.entries.set(dshId, {
                     acpSessionId: rec['acpSessionId'],
                     accountId: rec['accountId'],
+                    ...(engineMode !== undefined ? { engineMode } : {}),
+                    ...(sessionCwd !== undefined ? { sessionCwd } : {}),
                     systemHash: rec['systemHash'],
                     knownIds: rec['knownIds'].filter((x) => typeof x === 'string'),
                     advertisedTools: Array.isArray(rec['advertisedTools']) ? rec['advertisedTools'] : [],

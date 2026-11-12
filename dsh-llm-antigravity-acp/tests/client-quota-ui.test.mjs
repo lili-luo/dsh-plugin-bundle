@@ -188,7 +188,7 @@ const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-function loadClientPlugin({ language = 'zh-CN', remoteService, sessions, uiWorkspace } = {}) {
+function loadClientPlugin({ language = 'zh-CN', remoteService, sessions, uiWorkspace, clipboard } = {}) {
   const { React, mount } = createMiniReact()
   const listeners = new Map()
   const document = {
@@ -223,7 +223,7 @@ function loadClientPlugin({ language = 'zh-CN', remoteService, sessions, uiWorks
   const sandbox = {
     window,
     document,
-    navigator: { language },
+    navigator: { language, ...(clipboard === undefined ? {} : { clipboard }) },
     Date: CustomDate,
     console,
     TypeError,
@@ -721,7 +721,7 @@ test('QuotaPill follows the selected family: Claude and GPT use their own weekly
   view.unmount()
 })
 
-function recordingService(windowValue = 0, decodeValue = 3) {
+function recordingService(windowValue = 0, decodeValue = 3, degradeValue = 'truncation', engineValue = 'bridge') {
   const patches = []
   const service = {
     status: async () => ({
@@ -731,6 +731,8 @@ function recordingService(windowValue = 0, decodeValue = 3) {
       configuredContextWindow: windowValue,
       defaultEffort: 'high',
       longDecodeContinuations: decodeValue,
+      degradeAction: degradeValue,
+      engineMode: engineValue,
       unlock: { status: 'unlocked' },
     }),
     quota: async () => ({ status: 'ok', updatedAt: new Date(FIXED_NOW).toISOString(), groups: [] }),
@@ -739,6 +741,8 @@ function recordingService(windowValue = 0, decodeValue = 3) {
       patches.push(patch)
       if ('contextWindow' in patch) windowValue = patch.contextWindow
       if ('longDecodeContinuations' in patch) decodeValue = patch.longDecodeContinuations
+      if ('degradeAction' in patch) degradeValue = patch.degradeAction
+      if ('engineMode' in patch) engineValue = patch.engineMode
       return service.status()
     },
   }
@@ -803,6 +807,8 @@ test('SettingsCard renders live settings as value rows that apply the chosen opt
     '上下文窗口自动 (1M)',
     '默认思考High',
     '超长续写3 段',
+    '降智处理128K截断重答',
+    '引擎模式DSH 工具桥接',
   ])
   assert.equal(rows.every((row) => row.props.disabled === false), true)
 
@@ -964,7 +970,7 @@ test('ModelParameterRows collapses on outside pointerdown and on the first Escap
   view.unmount()
 })
 
-test('SettingsCard keeps its three choice rows mutually exclusive', async () => {
+test('SettingsCard keeps its four choice rows mutually exclusive', async () => {
   const { service } = recordingService()
   const { registered, mount } = loadClientPlugin({ language: 'zh-CN', remoteService: service })
   const slot = registered.get('settings.section')
@@ -996,6 +1002,53 @@ test('SettingsCard keeps its three choice rows mutually exclusive', async () => 
   assert.equal(choices().length, 3)
   assert.deepEqual(choices().map(textOf), ['关闭', '3 段', '8 段'])
 
+  // Click "降智处理" -> the decode panel folds away, only the 3 levels show.
+  expandedRows()[3].props.onClick()
+  await flush()
+  assert.equal(expandedRows()[2].props['aria-expanded'], false)
+  assert.equal(expandedRows()[3].props['aria-expanded'], true)
+  assert.deepEqual(choices().map(textOf), ['128K截断重答', '全量降智拦截重答', '仅监测提示'])
+
+  // Click "引擎模式" -> the degrade panel folds away, only the 2 engine modes show.
+  expandedRows()[4].props.onClick()
+  await flush()
+  assert.equal(expandedRows()[3].props['aria-expanded'], false)
+  assert.equal(expandedRows()[4].props['aria-expanded'], true)
+  assert.deepEqual(choices().map(textOf), ['DSH 工具桥接', '原生 Agent（满血）'])
+
+  view.unmount()
+})
+
+test('SettingsCard switches the degraded-route level and engine mode live through configure', async () => {
+  const { service, patches } = recordingService()
+  const { registered, mount } = loadClientPlugin({ language: 'en-US', remoteService: service })
+  const slot = registered.get('settings.section')
+  const view = mount(slot.Component, slot.meta.inject())
+  await flush()
+
+  const degradeRow = () => findAll(view.tree, (node) => node.props && node.props['aria-expanded'] !== undefined)[3]
+  const engineRow = () => findAll(view.tree, (node) => node.props && node.props['aria-expanded'] !== undefined)[4]
+  assert.equal(textOf(degradeRow()), 'Degraded routeRe-answer on 128K truncation')
+  assert.equal(textOf(engineRow()), 'Engine modeDSH tool bridge')
+  degradeRow().props.onClick()
+  await flush()
+  const options = findAll(view.tree, (node) => node.tag === 'button' && node.props['aria-checked'] !== undefined)
+  assert.deepEqual(options.map(textOf), ['Re-answer on 128K truncation', 'Re-answer on any flag', 'Observe only'])
+  assert.equal(options[0].props['aria-checked'], true)
+  options[2].props.onClick()
+  await flush()
+  assert.deepEqual(JSON.parse(JSON.stringify(patches)), [{ degradeAction: 'observe' }])
+  assert.equal(textOf(degradeRow()), 'Degraded routeObserve only')
+
+  engineRow().props.onClick()
+  await flush()
+  const engineChoices = findAll(view.tree, (node) => node.tag === 'button' && node.props['aria-checked'] !== undefined)
+  assert.deepEqual(engineChoices.map(textOf), ['DSH tool bridge', 'Native agent (full strength)'])
+  assert.equal(engineChoices[0].props['aria-checked'], true)
+  engineChoices[1].props.onClick()
+  await flush()
+  assert.deepEqual(JSON.parse(JSON.stringify(patches)), [{ degradeAction: 'observe' }, { engineMode: 'native' }])
+  assert.equal(textOf(engineRow()), 'Engine modeNative agent (full strength)')
   view.unmount()
 })
 
@@ -1027,11 +1080,13 @@ test('SettingsCard paints status with interactive choice rows while quota is sti
   // The status half is already on screen ...
   assert.match(textOf(view.tree), /已连接/)
   const rows = findAll(view.tree, (node) => node.props && node.props['aria-expanded'] !== undefined)
-  assert.equal(rows.length, 3, 'all three choice rows render before quota resolves')
+  assert.equal(rows.length, 5, 'all five choice rows render before quota resolves')
   assert.deepEqual(rows.map(textOf), [
     '上下文窗口自动 (1M)',
     '默认思考High',
     '超长续写3 段',
+    '降智处理128K截断重答',
+    '引擎模式DSH 工具桥接',
   ])
   assert.equal(rows.every((row) => row.props.disabled === false), true,
     'a slow quota read must never disable or fade out the choice rows')
@@ -1149,6 +1204,63 @@ test('AccountsPanel renders account cards, forwards SmallButton style, and suppo
   assert.ok(submitBtn)
   assert.ok(String(submitBtn.props.className).includes('dsh-agy-btn-primary'))
   assert.equal(submitBtn.props.style.height, 34)
+
+  view.unmount()
+})
+
+test('the sign-in ticket copies its link and terminal command from their own rows', async () => {
+  const writes = []
+  const url = 'https://accounts.google.com/o/oauth2/auth?client_id=abc&code_challenge=xyz'
+  const command = 'HOME=/tmp/acc-qih25eai /usr/local/bin/agy acp --login'
+  const { registered, mount } = loadClientPlugin({
+    language: 'zh-CN',
+    clipboard: { writeText: async (text) => { writes.push(String(text)) } },
+    remoteService: {
+      status: async () => accountsStatus([
+        accountRow('acc-1', { state: 'idle', email: undefined }),
+      ]),
+      quota: async () => ({ status: 'ok', updatedAt: new Date(FIXED_NOW).toISOString(), groups: [] }),
+      login: async () => ({ url, command }),
+    },
+  })
+
+  const slot = registered.get('settings.section')
+  const view = mount(slot.Component, slot.meta.inject())
+  await flush()
+  findOne(view.tree, (n) => n.tag === 'button' && textOf(n) === '登录').props.onClick()
+  await flush()
+
+  // Each read-only line is its own flex row: the text keeps the free width and
+  // the copy control keeps its own, so a long URL never pushes it out of view.
+  const rows = findAll(view.tree, (n) => n.props && 'data-agy-ticket' in n.props)
+  assert.deepEqual(rows.map((n) => n.props['data-agy-ticket']), ['link', 'command'])
+  assert.equal(rows.every((n) => n.props.className === 'dsh-agy-ticket-row'), true)
+  const copyButtons = findAll(view.tree, (n) => n.tag === 'button' && n.props['data-agy-copy'] !== undefined)
+  assert.deepEqual(copyButtons.map((n) => n.props['data-agy-copy']), ['link', 'command'])
+  assert.deepEqual(copyButtons.map((n) => n.props['aria-label']), ['复制授权链接', '复制终端命令'])
+  assert.ok(findOne(rows[0], (n) => n.tag === 'button' && n.props['data-agy-copy'] === 'link'),
+    'the link row owns the link copy action')
+  assert.ok(findOne(rows[1], (n) => n.tag === 'button' && n.props['data-agy-copy'] === 'command'),
+    'the command row owns the command copy action')
+
+  // Copying is per line, reports success on the button itself, and never
+  // disturbs the surrounding card.
+  findOne(rows[0], (n) => n.tag === 'button' && n.props['data-agy-copy'] === 'link').props.onClick()
+  await flush()
+  assert.deepEqual(writes, [url])
+  const copied = findOne(view.tree, (n) => n.tag === 'button' && n.props['data-agy-copy'] === 'link')
+  assert.equal(copied.props['data-copied'], 'true')
+  assert.equal(copied.props['aria-label'], '已复制')
+  assert.equal(copied.props.title, '已复制')
+  assert.ok(findOne(copied, (n) => n.props && n.props.className === 'dsh-agy-check'),
+    'the copied state swaps in the check glyph')
+
+  findOne(view.tree, (n) => n.tag === 'button' && n.props['data-agy-copy'] === 'command').props.onClick()
+  await flush()
+  assert.deepEqual(writes, [url, command])
+  assert.equal(findOne(view.tree, (n) => n.props && n.props.className === 'dsh-agy-ticket-command').props.children[0], command)
+  assert.ok(findOne(view.tree, (n) => n.tag === 'input' && n.props['aria-label'] === '授权码'),
+    'the paste field survives the added controls')
 
   view.unmount()
 })
@@ -1806,6 +1918,92 @@ test('QuotaPill displays session-scoped degraded diagnostic signals and auto-hea
   assert.equal(findOne(degradedView.tree, (n) => n.props && n.props['data-agy-degrade-card'] === 'true'), null)
 
   degradedView.unmount()
+})
+
+test('QuotaPill shows live route health and auto re-answer counts on Gemini 4 Carbon too', async () => {
+  const carbonHealth = (extra) => ({
+    acpSessionId: 'acp-carbon',
+    model: 'gemini-4-carbon',
+    streamTps: 410,
+    wallTps: 300,
+    ttftSeconds: 2.1,
+    thoughtTokens: 0,
+    contextTokens: 127997,
+    consecutiveDegradedTurns: 1,
+    hasHealthyArgonCache: false,
+    updatedAt: new Date(FIXED_NOW).toISOString(),
+    ...extra,
+  })
+  const { registered, mount, store } = loadClientPlugin({
+    language: 'zh-CN',
+    remoteService: {
+      status: async () => ({
+        state: 'ready',
+        version: '1.5.5',
+        contextWindow: 1_048_576,
+        configuredContextWindow: 0,
+        defaultEffort: 'high',
+        longDecodeContinuations: 3,
+        degradeAction: 'truncation',
+        sessionHealth: {
+          'carbon-degraded': carbonHealth({
+            sessionId: 'carbon-degraded',
+            degraded: true,
+            score: 5,
+            signals: [{ kind: 'context_truncated', points: 5, detail: '378K→128K', cwmEstTokens: 378421 }],
+            interceptedSteps: 0,
+          }),
+          'carbon-healed': carbonHealth({
+            sessionId: 'carbon-healed',
+            degraded: false,
+            score: 0,
+            signals: [],
+            consecutiveDegradedTurns: 0,
+            interceptedSteps: 3,
+          }),
+        },
+      }),
+      quota: async () => ({
+        status: 'ok',
+        updatedAt: new Date(FIXED_NOW).toISOString(),
+        groups: [{
+          name: 'Gemini Models',
+          description: '',
+          buckets: [{ id: 'weekly', name: 'Weekly', window: 'weekly', remainingFraction: 0.8, resetTime: isoAfterHours(60) }],
+        }],
+      }),
+    },
+  })
+  store.setCurrent({ provider: 'antigravity', model: 'gemini-4-carbon' })
+  const slot = registered.get('conversation.input.right')
+
+  const degradedView = mount(slot.Component, slot.meta.inject('carbon-degraded'))
+  await flush()
+  const pillBtn = findOne(degradedView.tree, (n) => n.tag === 'button')
+  assert.match(textOf(pillBtn), /降智$/, 'a degraded Carbon session carries the warning chip')
+  assert.match(pillBtn.props.title, /可能降智/)
+  pillBtn.props.onClick()
+  await flush()
+  const card = findOne(degradedView.tree, (n) => n.props && n.props['data-agy-degrade-card'] === 'true')
+  assert.ok(card, 'the Carbon popover renders the route diagnostic card')
+  assert.match(textOf(card), /上下文被截到 128K（原 378K）/)
+  degradedView.unmount()
+
+  const healedView = mount(slot.Component, slot.meta.inject('carbon-healed'))
+  await flush()
+  const healedBtn = findOne(healedView.tree, (n) => n.tag === 'button')
+  assert.equal(findOne(healedView.tree, (n) => n.props && n.props['data-agy-degraded'] === 'true'), null)
+  healedBtn.props.onClick()
+  await flush()
+  const healedNote = findOne(healedView.tree, (n) => n.props && n.props['data-agy-gatekeeper-healed'] === '3')
+  assert.ok(healedNote, 'the Carbon drawer reports its intercepted count')
+  assert.match(textOf(healedNote), /本会话已自动重答 3 次/)
+
+  // A non-flagship model hides the route state again.
+  store.setCurrent({ provider: 'antigravity', model: 'gemini-3.8-flash' })
+  await flush()
+  assert.equal(findOne(healedView.tree, (n) => n.props && n.props['data-agy-gatekeeper-healed'] !== undefined), null)
+  healedView.unmount()
 })
 
 test('QuotaPill reports an unentitled model instead of another family’s 100%', async () => {

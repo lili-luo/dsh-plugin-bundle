@@ -354,6 +354,7 @@ function stripEffortLabel(displayName) {
     return displayName.replace(/\s*\((Low|Medium|High)\)\s*$/i, '').trim();
 }
 const DEFAULT_FAMILY_DISPLAY_NAMES = {
+    'gemini-4-carbon': 'Gemini 4 Carbon',
     'gemini-4-argon': 'Gemini 4 Argon',
     'gemini-3.8-flash': 'Gemini 3.8 Flash',
     'claude-opus-5-5': 'Claude Opus 5.5',
@@ -526,6 +527,13 @@ function summarizeClaudeGptLabel(models) {
 }
 function summarizeGeminiLabel(models, includeArgon) {
     const hasFlash38 = models.some(m => m.id.toLowerCase().startsWith('gemini-3.8'));
+    // Carbon ships on the same shared Ultra pool as Argon; a pool that serves it
+    // names it first, matching the upstream Recommended ordering.
+    const hasCarbon = models.some(m => m.id.toLowerCase().startsWith('gemini-4-carbon'));
+    if (includeArgon && hasCarbon && hasFlash38)
+        return 'Gemini 4 Carbon / Argon / 3.8';
+    if (includeArgon && hasCarbon)
+        return 'Gemini 4 Carbon / Argon';
     if (includeArgon && hasFlash38)
         return 'Gemini 4 Argon / 3.8';
     if (includeArgon)

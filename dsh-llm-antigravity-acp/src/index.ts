@@ -152,6 +152,10 @@ export function apply(ctx: Context, config: Config): void {
     defaultEffort: config.defaultEffort,
     longDecodeContinuations: config.longDecodeContinuations,
     visibleModels: config.visibleModels,
+    degradeAction: config.degradeAction,
+    engineMode: config.engineMode,
+    displayName: config.displayName,
+    modelDisplayNames: config.modelDisplayNames,
   }
   // Every account runs the CLI under its own `$HOME`, which is what keeps its
   // credential store separate; callers pass that overlay, and an omitted

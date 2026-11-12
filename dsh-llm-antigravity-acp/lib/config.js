@@ -7,6 +7,27 @@
 import z from '@deepseek-ai/schemastery';
 /** Reasoning effort ids accepted by the Antigravity ACP `thought_level` option. */
 export const EFFORTS = ['low', 'medium', 'high'];
+/**
+ * What the route-health fingerprint may do with a Gemini 4 flagship (Argon or
+ * Carbon) step it flags:
+ * - `observe`: record and display the verdict only; never refuse an answer or a tool call.
+ * - `truncation`: refuse and re-answer only when the billed input was cut to the
+ *   128K ceiling (`context_truncated`), the one signal that proves the model did
+ *   not see the request; speed, cache-granularity, and shallow-thought signals
+ *   are recorded only.
+ * - `legacy`: refuse and re-answer on any degraded verdict (score >= 3), the
+ *   behavior before 0.4.1.
+ */
+export const DEGRADE_ACTIONS = ['observe', 'truncation', 'legacy'];
+/**
+ * How the plugin runs the Antigravity ACP agent:
+ * - `bridge`: launch `agy acp --agent dsh-bridge`, disabling built-in tools and
+ *   identity so DSH owns the system prompt and every tool call.
+ * - `native`: launch `agy acp` with its native identity and built-in workspace
+ *   tools (`read_file`, `edit_file`, `write_file`, `run_command`, etc.) in the
+ *   session working directory, exposing non-overlapping DSH tools on MCP.
+ */
+export const ENGINE_MODES = ['bridge', 'native'];
 function maybeVolatile(schema) {
     const candidate = schema;
     return typeof candidate.volatile === 'function' ? candidate.volatile() : schema;
@@ -45,6 +66,8 @@ export const Config = z.object({
     longDecodeContinuations: maybeVolatile(z.number().step(1).min(0).max(16).default(3)),
     warmup: z.boolean().default(true),
     quotaTtlMs: z.number().step(1).min(5_000).default(120_000),
+    degradeAction: maybeVolatile(z.union(DEGRADE_ACTIONS).default('truncation')),
+    engineMode: maybeVolatile(z.union(ENGINE_MODES).default('bridge')),
     // The published schemastery declarations type `.volatile()` fields as plain values.
 });
 /**
@@ -65,4 +88,20 @@ export function current(value) {
  */
 export function asEffort(value) {
     return EFFORTS.includes(value ?? '') ? value : undefined;
+}
+/**
+ * Narrow an arbitrary id to a route-health intervention level.
+ * @param value - requested level id.
+ * @returns the level, or undefined when it is not one of {@link DEGRADE_ACTIONS}.
+ */
+export function asDegradeAction(value) {
+    return typeof value === 'string' && DEGRADE_ACTIONS.includes(value) ? value : undefined;
+}
+/**
+ * Narrow an arbitrary id to an Antigravity ACP engine mode.
+ * @param value - requested engine mode id.
+ * @returns the engine mode, or undefined when it is not one of {@link ENGINE_MODES}.
+ */
+export function asEngineMode(value) {
+    return typeof value === 'string' && ENGINE_MODES.includes(value) ? value : undefined;
 }

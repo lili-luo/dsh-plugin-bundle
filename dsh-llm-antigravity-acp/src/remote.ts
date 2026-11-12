@@ -9,7 +9,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { InvocationDescriptor, TypertCodec } from '@deepseek-ai/dsh-typert-protocol'
 import { SYSTEM_ACCOUNT_LABEL, type AccountStatus, type LoginResult, type LoginTicket } from './accounts.ts'
-import { asEffort, type AccountProfile } from './config.ts'
+import { asDegradeAction, asEffort, asEngineMode, type AccountProfile } from './config.ts'
 import type { QuotaSnapshot } from './quota.ts'
 import type { AntigravityRuntime, LiveOverrides, RuntimeStatus } from './runtime.ts'
 
@@ -201,9 +201,9 @@ export function parseConfigureRequest(value: unknown): LiveOverrides {
       throw new TypeError('Invalid antigravity modelDisplayNames')
     }
     out.modelDisplayNames = Object.create(null) as Record<string, string>
-    for (const [id, value] of Object.entries(names)) {
+    for (const [id, alias] of Object.entries(names)) {
       if (!id.trim() || id.length > 200) throw new TypeError('Invalid antigravity model display name id')
-      const name = displayName(value)
+      const name = displayName(alias)
       if (name) out.modelDisplayNames[id] = name
     }
   }
@@ -227,6 +227,16 @@ export function parseConfigureRequest(value: unknown): LiveOverrides {
       throw new TypeError('Invalid antigravity longDecodeContinuations')
     }
     out.longDecodeContinuations = record.longDecodeContinuations
+  }
+  if (record.degradeAction !== undefined) {
+    const action = asDegradeAction(record.degradeAction)
+    if (action === undefined) throw new TypeError('Invalid antigravity degradeAction')
+    out.degradeAction = action
+  }
+  if (record.engineMode !== undefined) {
+    const mode = asEngineMode(record.engineMode)
+    if (mode === undefined) throw new TypeError('Invalid antigravity engineMode')
+    out.engineMode = mode
   }
   if (record.visibleModels !== undefined) out.visibleModels = parseVisibleModels(record.visibleModels, 'Invalid antigravity configure request.visibleModels')
   return out
@@ -430,7 +440,6 @@ export class AntigravityRemote extends TypertRemoteService {
     const patch = parseConfigureRequest(request)
     const settings = this.ctx.get('settings') as SettingsWriter | undefined
     // Alias edits must not look saved when the profile refused persistence.
-    // Store these presentation-only fields before applying their live override.
     const aliases: LiveOverrides = {
       ...patch.displayName !== undefined ? { displayName: patch.displayName } : {},
       ...patch.modelDisplayNames !== undefined ? { modelDisplayNames: patch.modelDisplayNames } : {},

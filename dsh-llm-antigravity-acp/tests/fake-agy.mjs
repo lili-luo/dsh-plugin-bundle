@@ -22,6 +22,10 @@
 //   QUOTA                   fail a prompt carrying it with a quota JSON-RPC error
 //   RATELIMIT               fail a prompt carrying it with a 429 rate-limit JSON-RPC error stating a retry delay
 //
+// `FAKE_AGY_EXTRA_MODELS` (comma list) appends effort-tiered families such as
+// `gemini-4-carbon` to the advertised catalog; `FAKE_AGY_ARGV` names a JSONL
+// file that receives the process argv once at startup.
+//
 // Plan mode (opt-in through `FAKE_AGY_PLAN`, a JSON array) ignores the prompt
 // text: the n-th `session/prompt` of the whole process (across every ACP
 // session) answers with the n-th entry, so a test scripts an exact sequence of
@@ -56,8 +60,18 @@ const log = process.env.FAKE_AGY_LOG
 const initLog = process.env.FAKE_AGY_INIT
 const mcpLog = process.env.FAKE_AGY_MCP
 const lifecycleLog = process.env.FAKE_AGY_LIFECYCLE
+/** JSONL of every `session/set_config_option` write, for tests that pin the selection handshake. */
+const configLog = process.env.FAKE_AGY_CONFIG_LOG
 const failMode = process.env.FAKE_AGY_FAIL ?? ''
 const omitModels = new Set((process.env.FAKE_AGY_OMIT_MODELS ?? '').split(',').map(s => s.trim()).filter(Boolean))
+/** Extra effort-tiered families appended after the default catalog, e.g. `gemini-4-carbon`. */
+const extraModels = (process.env.FAKE_AGY_EXTRA_MODELS ?? '').split(',').map(s => s.trim()).filter(Boolean)
+/** JSONL of the process argv, for tests that pin the `agy acp` command line. */
+const argvLog = process.env.FAKE_AGY_ARGV
+if (argvLog) appendFileSync(argvLog, `${JSON.stringify(process.argv.slice(2))}\n`)
+/** JSONL of the process working directory at startup, for tests that pin `frontCwd`. */
+const procCwdLog = process.env.FAKE_AGY_PROC_CWD
+if (procCwdLog) appendFileSync(procCwdLog, `${JSON.stringify(process.cwd())}\n`)
 const geminiDirFlag = process.argv.indexOf('--gemini-dir')
 const geminiDir = geminiDirFlag >= 0 ? process.argv[geminiDirFlag + 1] : undefined
 const persistedFile = geminiDir ? join(geminiDir, 'fake-sessions.json') : undefined
@@ -79,9 +93,9 @@ function readPlan() {
   }
 }
 /** Record one ACP session lifecycle event for tests that prove a session stayed open. */
-function noteLifecycle(op, sessionId) {
+function noteLifecycle(op, sessionId, cwd) {
   if (lifecycleLog === undefined) return
-  try { appendFileSync(lifecycleLog, `${JSON.stringify({ op, session: sessionId })}\n`) } catch { /* ignore */ }
+  try { appendFileSync(lifecycleLog, `${JSON.stringify({ op, session: sessionId, ...(cwd !== undefined ? { cwd } : {}) })}\n`) } catch { /* ignore */ }
 }
 if (persistedFile && existsSync(persistedFile)) {
   try {
@@ -95,7 +109,7 @@ function persistSessions() {
   if (!persistedFile) return
   try {
     mkdirSync(dirname(persistedFile), { recursive: true })
-    const serializable = [...sessions.values()].map(s => ({ id: s.id, model: s.model, level: s.level, system: s.system, genIdx: s.genIdx ?? 0 }))
+    const serializable = [...sessions.values()].map(s => ({ id: s.id, model: s.model, level: s.level, cwd: s.cwd, system: s.system, genIdx: s.genIdx ?? 0 }))
     writeFileSync(persistedFile, JSON.stringify({ nextSession, pendingGatedStages, sessions: serializable }))
   } catch { /* ignore */ }
 }
@@ -161,10 +175,11 @@ const ALL_MODELS = [
   { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
   { value: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5' },
   { value: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' },
+  ...extraModels.map(id => ({ value: id, name: id })),
 ]
 const offeredModels = () => ALL_MODELS.filter(m => !omitModels.has(m.value))
 const availableModels = () => [
-  ...['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5']
+  ...['gemini-4-argon', 'gemini-3.8-flash', 'claude-opus-5-5', 'claude-sonnet-5-5', ...extraModels]
     .filter(id => !omitModels.has(id))
     .flatMap(id => ['low', 'medium', 'high'].map(level => ({ modelId: `${id}-${level}`, name: `${id} (${level})` }))),
   ...(omitModels.has('gpt-oss-120b-medium') ? [] : [{ modelId: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' }]),
@@ -260,6 +275,57 @@ async function runToolCall(s, name, args, opts = {}) {
   return text
 }
 
+/**
+ * Simulate one native Antigravity built-in tool call (`read_file`, `write_file`,
+ * `edit_file`, `run_command`, `search_web`, etc.): emit `session/update`
+ * (`tool_call` + optional `tool_call_update`) and ask `session/request_permission`
+ * without `mcpServerName`.
+ */
+async function runBuiltinCall(s, spec = {}) {
+  const toolCallId = spec.toolCallId ?? `builtin_${++toolCallSeq}`
+  const name = spec.name
+  const kind = spec.kind ?? 'other'
+  const title = spec.title ?? name ?? kind
+  const locations = spec.locations
+  const rawInput = spec.rawInput ?? {}
+  if (!spec.noReport) {
+    update(s.id, {
+      sessionUpdate: 'tool_call',
+      toolCallId,
+      ...(name !== undefined ? { name } : {}),
+      title,
+      kind,
+      ...(locations !== undefined ? { locations } : {}),
+      rawInput: spec.reportRawInput !== undefined ? spec.reportRawInput : rawInput,
+    })
+  }
+  if (Array.isArray(spec.updates)) {
+    for (const extra of spec.updates) {
+      update(s.id, { sessionUpdate: 'tool_call_update', toolCallId, ...extra })
+    }
+  }
+  const outcome = await askPermission(s, {
+    toolCallId,
+    ...(spec.claimName !== undefined ? { name: spec.claimName } : (name !== undefined ? { name } : {})),
+    title: spec.claimTitle ?? title,
+    kind: spec.claimKind ?? kind,
+    ...(spec.claimLocations !== undefined ? { locations: spec.claimLocations } : (locations !== undefined ? { locations } : {})),
+    rawInput: spec.claimRawInput !== undefined ? spec.claimRawInput : rawInput,
+  }, spec.sessionIdOverride, spec.alwaysOnly ? 'always-only' : undefined)
+  const selected = outcome?.outcome === 'selected' ? String(outcome.optionId) : 'cancelled'
+  const label = name ?? kind
+  if (!selected.startsWith('allow')) {
+    if (spec.abortOnReject === true) {
+      update(s.id, { sessionUpdate: 'tool_call_update', toolCallId, status: 'failed' })
+      return { abortedByReject: true }
+    }
+    update(s.id, { sessionUpdate: 'tool_call_update', toolCallId, status: 'refused' })
+    return `BUILTIN(${label})=PERMISSION_${selected.startsWith('reject') ? 'REJECTED' : 'CANCELLED'}`
+  }
+  update(s.id, { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' })
+  return `BUILTIN(${label})=ALLOWED:${selected}`
+}
+
 /** Write one plan part's gen_metadata and thought chunk, in that order. */
 function beginPlanPart(s, part) {
   if (part.gen) {
@@ -288,6 +354,23 @@ async function runPlanStage(s, stage) {
   let text = ''
   for (const part of parts) {
     beginPlanPart(s, part)
+    if (Array.isArray(part.builtins)) {
+      for (const b of part.builtins) {
+        const res = await runBuiltinCall(s, b)
+        if (s.cancelled) return { stopReason: 'cancelled' }
+        if (res && typeof res === 'object' && res.abortedByReject === true) {
+          return { stopReason: 'end_turn', usage: { inputTokens: 400, outputTokens: 20, totalTokens: 420 } }
+        }
+        if (part.text === undefined && !Array.isArray(part.chunks)) text += `${res} `
+      }
+    } else if (part.builtin !== undefined) {
+      const res = await runBuiltinCall(s, part.builtin)
+      if (s.cancelled) return { stopReason: 'cancelled' }
+      if (res && typeof res === 'object' && res.abortedByReject === true) {
+        return { stopReason: 'end_turn', usage: { inputTokens: 400, outputTokens: 20, totalTokens: 420 } }
+      }
+      if (part.text === undefined && !Array.isArray(part.chunks)) text += `${res} `
+    }
     if (part.tool !== undefined) {
       const result = await runToolCall(s, part.tool.name, part.tool.args ?? {})
       if (s.cancelled) return { stopReason: 'cancelled' }
@@ -384,6 +467,13 @@ async function runPrompt(s, text) {
       const [, name, ...rest] = line.split(' ')
       const result = await runToolCall(s, name, JSON.parse(rest.join(' ')))
       output.push(`RESULT(${name})=${result}`)
+    } else if (line.startsWith('BUILTIN ')) {
+      const spec = JSON.parse(line.slice(8))
+      const result = await runBuiltinCall(s, spec)
+      if (result && typeof result === 'object' && result.abortedByReject === true) {
+        return { stopReason: 'end_turn', usage: { inputTokens: 400, outputTokens: 20, totalTokens: 420 } }
+      }
+      output.push(result)
     } else if (line.startsWith('DENYCALL ')) {
       const [, name, ...rest] = line.split(' ')
       const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), { structured: null, title: name, rawInput: { cmd: `mcp_dsh_${name}` } })
@@ -466,17 +556,18 @@ rl.on('line', async (line) => {
       return send({ jsonrpc: '2.0', id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true, mcpCapabilities: { http: true } }, agentInfo: { name: 'fake-agy', version: '0.0.1' } } })
     }
     if (method === 'session/new') {
-      const defaultModel = offeredModels()[0]?.value ?? 'gemini-3.8-flash'
-      const s = { id: `s${nextSession++}`, model: defaultModel, level: 'medium', mcp: params.mcpServers?.[0], system: params._meta?.antigravity?.systemPrompt?.append ?? '', tools: [], genIdx: 0 }
+      // A stuck model also opens every new session, so a request for another model must switch.
+      const defaultModel = process.env.FAKE_AGY_STUCK_MODEL || (offeredModels()[0]?.value ?? 'gemini-3.8-flash')
+      const s = { id: `s${nextSession++}`, model: defaultModel, level: 'medium', cwd: params.cwd, mcp: params.mcpServers?.[0], system: params._meta?.antigravity?.systemPrompt?.append ?? '', tools: [], genIdx: 0 }
       sessions.set(s.id, s)
-      noteLifecycle('new', s.id)
+      noteLifecycle('new', s.id, s.cwd)
       persistSessions()
       if (s.mcp && !process.env.FAKE_AGY_NO_HANDSHAKE) {
         await mcp(s.mcp, { jsonrpc: '2.0', id: ++rpcId, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fake', version: '0' } } })
         s.tools = (await mcp(s.mcp, { jsonrpc: '2.0', id: ++rpcId, method: 'tools/list', params: {} })).result.tools.map(t => t.name)
       }
       if (mcpLog) {
-        appendFileSync(mcpLog, `${JSON.stringify({ op: 'new', session: s.id, url: s.mcp?.url, authorization: s.mcp?.headers?.find(h => h.name.toLowerCase() === 'authorization')?.value })}\n`)
+        appendFileSync(mcpLog, `${JSON.stringify({ op: 'new', session: s.id, cwd: s.cwd, url: s.mcp?.url, authorization: s.mcp?.headers?.find(h => h.name.toLowerCase() === 'authorization')?.value })}\n`)
       }
       return send({ jsonrpc: '2.0', id, result: { sessionId: s.id, configOptions: configOptions(s), models: { availableModels: availableModels(), currentModelId: `${s.model}-${s.level}` } } })
     }
@@ -485,7 +576,8 @@ rl.on('line', async (line) => {
       if (!s) {
         return send({ jsonrpc: '2.0', id, error: { code: -32004, message: `Session "${params?.sessionId}" not found` } })
       }
-      noteLifecycle('load', s.id)
+      if (params.cwd !== undefined) s.cwd = params.cwd
+      noteLifecycle('load', s.id, s.cwd)
       s.mcp = params.mcpServers?.[0]
       if (params._meta?.antigravity?.systemPrompt?.append !== undefined) {
         s.system = params._meta.antigravity.systemPrompt.append
@@ -495,25 +587,28 @@ rl.on('line', async (line) => {
         s.tools = (await mcp(s.mcp, { jsonrpc: '2.0', id: ++rpcId, method: 'tools/list', params: {} })).result.tools.map(t => t.name)
       }
       if (mcpLog) {
-        appendFileSync(mcpLog, `${JSON.stringify({ op: 'load', session: s.id, url: s.mcp?.url, authorization: s.mcp?.headers?.find(h => h.name.toLowerCase() === 'authorization')?.value })}\n`)
+        appendFileSync(mcpLog, `${JSON.stringify({ op: 'load', session: s.id, cwd: s.cwd, url: s.mcp?.url, authorization: s.mcp?.headers?.find(h => h.name.toLowerCase() === 'authorization')?.value })}\n`)
       }
       return send({ jsonrpc: '2.0', id, result: { sessionId: s.id, configOptions: configOptions(s), models: { availableModels: availableModels(), currentModelId: `${s.model}-${s.level}` } } })
     }
     const s = sessions.get(params?.sessionId)
     if (method === 'session/set_config_option') {
-      if (params.configId === 'model') s.model = params.value
+      if (configLog) appendFileSync(configLog, `${JSON.stringify({ session: s.id, configId: params.configId, value: params.value })}\n`)
+      // `FAKE_AGY_STUCK_MODEL` / `FAKE_AGY_STUCK_LEVEL` accept the write but keep reporting
+      // the stuck value, like an agent that silently ignores the switch.
+      if (params.configId === 'model') s.model = process.env.FAKE_AGY_STUCK_MODEL || params.value
       if (params.configId === 'thought_level') {
         if (s.model.startsWith('gpt-oss')) {
           return send({ jsonrpc: '2.0', id, error: { code: -32602, message: `Thinking level "${params.value}" is not offered for model "${s.model}"` } })
         }
-        s.level = params.value
+        s.level = process.env.FAKE_AGY_STUCK_LEVEL || params.value
       }
       persistSessions()
       return send({ jsonrpc: '2.0', id, result: { configOptions: configOptions(s) } })
     }
     if (method === 'session/prompt') {
       const text = params.prompt.filter(b => b.type === 'text').map(b => b.text).join('')
-      if (log) appendFileSync(log, `${JSON.stringify({ session: s.id, text, images: params.prompt.filter(b => b.type === 'image').length, tools: s.tools, model: s.model, level: s.level, system: s.system })}\n`)
+      if (log) appendFileSync(log, `${JSON.stringify({ session: s.id, cwd: s.cwd, text, images: params.prompt.filter(b => b.type === 'image').length, tools: s.tools, model: s.model, level: s.level, system: s.system })}\n`)
       s.cancelled = false
       if (failMode === 'quota' && text.includes('QUOTA')) {
         return send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'QUOTA: Claude and GPT models weekly limit reached' } })
@@ -524,6 +619,12 @@ rl.on('line', async (line) => {
       const result = planEntries !== undefined && planCursor < planEntries.length
         ? await runPlanStage(s, planEntries[planCursor++])
         : await runPrompt(s, text)
+      // `FAKE_AGY_DRIFT_LEVEL` moves the thinking level after every prompt and
+      // announces it through `config_option_update`, like an agent-side reset.
+      if (process.env.FAKE_AGY_DRIFT_LEVEL) {
+        s.level = process.env.FAKE_AGY_DRIFT_LEVEL
+        update(s.id, { sessionUpdate: 'config_option_update', configOptions: configOptions(s) })
+      }
       return send({ jsonrpc: '2.0', id, result })
     }
     if (method === 'session/close') {
