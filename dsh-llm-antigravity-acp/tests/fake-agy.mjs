@@ -4,6 +4,7 @@
 // supports `session/load` resumption across evictions/restarts, and follows
 // directives embedded in prompt text:
 //   CALL <tool> <json>      report the tool call, ask permission, call one MCP tool
+//   NAMEONLYCALL <tool> <json>  report `name: "mcp_dsh_<tool>"` without mcpServerName/mcpToolName (agy >= 1.5.8)
 //   GATEDCALL <spec> => <spec> ...  write real gen_metadata before each call; retry in-turn on [HARNESS_GATEKEEPER]
 //   PCALL <tool> <json> ;; <tool> <json>   call several tools concurrently
 //   SLEEP <ms>              wait before ending the turn
@@ -233,6 +234,7 @@ async function runToolCall(s, name, args, opts = {}) {
   s.lastToolCallId = toolCallId
   const toolCall = {
     toolCallId,
+    ...(opts.reportName !== undefined ? { name: opts.reportName } : {}),
     title: opts.title ?? `mcp_dsh_${name}`,
     kind: opts.kind ?? 'other',
     rawInput: opts.rawInput ?? args,
@@ -242,6 +244,7 @@ async function runToolCall(s, name, args, opts = {}) {
     update(s.id, {
       sessionUpdate: 'tool_call',
       toolCallId,
+      ...(opts.reportName !== undefined ? { name: opts.reportName } : {}),
       title: toolCall.title,
       kind: toolCall.kind,
       rawInput: toolCall.rawInput,
@@ -474,6 +477,10 @@ async function runPrompt(s, text) {
         return { stopReason: 'end_turn', usage: { inputTokens: 400, outputTokens: 20, totalTokens: 420 } }
       }
       output.push(result)
+    } else if (line.startsWith('NAMEONLYCALL ')) {
+      const [, name, ...rest] = line.split(' ')
+      const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), { structured: null, reportName: `mcp_dsh_${name}`, title: `Run mcp_dsh_${name}`, statusOnlyUpdate: true })
+      output.push(`RESULT(${name})=${result}`)
     } else if (line.startsWith('DENYCALL ')) {
       const [, name, ...rest] = line.split(' ')
       const result = await runToolCall(s, name, JSON.parse(rest.join(' ')), { structured: null, title: name, rawInput: { cmd: `mcp_dsh_${name}` } })
