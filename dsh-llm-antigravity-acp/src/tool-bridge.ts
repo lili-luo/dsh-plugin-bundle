@@ -89,13 +89,40 @@ function nonEmpty(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
-function structuredToolMeta(toolCall: AcpPermissionRequest['toolCall']): { serverName?: string; toolName?: string } {
-  const meta: AcpToolCallMeta | undefined = toolCall?._meta
-  const serverName = nonEmpty(toolCall?.mcpServerName) ?? nonEmpty(meta?.mcpServerName) ?? nonEmpty(meta?.serverName) ?? nonEmpty(meta?.server)
-  const toolName = nonEmpty(toolCall?.mcpToolName) ?? nonEmpty(meta?.mcpToolName) ?? nonEmpty(meta?.toolName) ?? nonEmpty(meta?.tool)
+function parseAgentMcpName(name: string | undefined): { serverName: string; toolName: string } | undefined {
+  if (name === undefined || !name.startsWith(AGENT_TOOL_PREFIX)) return undefined
+  const toolName = name.slice(AGENT_TOOL_PREFIX.length)
+  return toolName.length > 0 ? { serverName: MCP_SERVER_NAME, toolName } : undefined
+}
+
+/**
+ * Extract structured MCP tool identity from explicit metadata fields or the
+ * agent's protocol tool `name` (`mcp_dsh_<tool>`), flagging contradictions
+ * between the two. `title` and `rawInput` are deliberately never consulted.
+ */
+function extractMcpIdentity(
+  carrier: {
+    mcpServerName?: unknown
+    mcpToolName?: unknown
+    name?: unknown
+    _meta?: AcpToolCallMeta
+  } | undefined,
+): { serverName?: string; toolName?: string; name?: string; conflict?: boolean } {
+  const meta: AcpToolCallMeta | undefined = carrier?._meta
+  const explicitServer = nonEmpty(carrier?.mcpServerName) ?? nonEmpty(meta?.mcpServerName) ?? nonEmpty(meta?.serverName) ?? nonEmpty(meta?.server)
+  const explicitTool = nonEmpty(carrier?.mcpToolName) ?? nonEmpty(meta?.mcpToolName) ?? nonEmpty(meta?.toolName) ?? nonEmpty(meta?.tool)
+  const name = nonEmpty(carrier?.name) ?? nonEmpty(meta?.name)
+  // agy >= 1.5.8 reports `name: "mcp_dsh_<tool>"` without `mcpServerName`/`mcpToolName` or `_meta`.
+  const parsed = parseAgentMcpName(name)
+  const conflict = (parsed !== undefined && explicitServer !== undefined && explicitServer !== parsed.serverName)
+    || (parsed !== undefined && explicitTool !== undefined && explicitTool !== parsed.toolName)
+  const serverName = explicitServer ?? parsed?.serverName
+  const toolName = explicitTool ?? parsed?.toolName
   return {
     ...(serverName !== undefined ? { serverName } : {}),
     ...(toolName !== undefined ? { toolName } : {}),
+    ...(name !== undefined ? { name } : {}),
+    ...(conflict ? { conflict: true } : {}),
   }
 }
 
@@ -112,15 +139,12 @@ export function recordReportedToolCall(
 ): 'created' | 'merged' | 'conflict' | undefined {
   if (update.sessionUpdate !== 'tool_call' && update.sessionUpdate !== 'tool_call_update') return
   if (typeof update.toolCallId !== 'string' || update.toolCallId.length === 0) return
-  const meta: AcpToolCallMeta | undefined = update._meta
-  const serverName = nonEmpty(update.mcpServerName) ?? nonEmpty(meta?.mcpServerName) ?? nonEmpty(meta?.serverName) ?? nonEmpty(meta?.server)
-  const toolName = nonEmpty(update.mcpToolName) ?? nonEmpty(meta?.mcpToolName) ?? nonEmpty(meta?.toolName) ?? nonEmpty(meta?.tool)
-  const name = nonEmpty(update.name) ?? nonEmpty(meta?.name)
+  const { serverName, toolName, name, conflict: selfConflict } = extractMcpIdentity(update)
   const title = nonEmpty(update.title)
   const kind = typeof update.kind === 'string' ? update.kind : undefined
   const existing = conv.reportedToolCalls.get(update.toolCallId)
   const merged: ReportedToolCall = existing === undefined ? {} : { ...existing }
-  let conflict = false
+  let conflict = selfConflict === true
   if (kind !== undefined) {
     if (merged.kind !== undefined && merged.kind !== kind) conflict = true
     else merged.kind = kind
@@ -383,13 +407,13 @@ export function answerPermission(
   const toolCallId = request.toolCall?.toolCallId
   if (typeof toolCallId !== 'string' || toolCallId.length === 0) return reject('missing toolCallId')
   const reported = state.reportedToolCalls.get(toolCallId)
-  const claimed = structuredToolMeta(request.toolCall)
+  const claimed = extractMcpIdentity(request.toolCall)
   const engineMode = state.engineMode ?? 'bridge'
   if (engineMode === 'native') {
     const isProbe = reported === undefined
       && claimed.serverName === undefined
       && claimed.toolName === undefined
-      && nonEmpty(request.toolCall?.name) === undefined
+      && claimed.name === undefined
       && request.toolCall?.kind === 'other'
       && isEmptyInput(request.toolCall.rawInput)
     const isMcp = reported?.serverName !== undefined
@@ -402,10 +426,10 @@ export function answerPermission(
     }
   }
   if (reported === undefined) {
-    if (claimed.serverName !== undefined || claimed.toolName !== undefined) {
+    if (claimed.conflict === true || claimed.serverName !== undefined || claimed.toolName !== undefined) {
       return reject(`tool call ${toolCallId} was never reported by the agent`)
     }
-    if (request.toolCall?.kind === 'other' && isEmptyInput(request.toolCall.rawInput)) {
+    if (claimed.name === undefined && request.toolCall?.kind === 'other' && isEmptyInput(request.toolCall.rawInput)) {
       if (!port.hasHandshake(tenantKey)) {
         return reject('identity-less probe without a completed MCP handshake')
       }
@@ -416,8 +440,12 @@ export function answerPermission(
   if (reported.conflict === true) {
     return reject(`reported identity of tool call ${toolCallId} conflicts across agent updates`)
   }
+  if (claimed.conflict === true) {
+    return reject(`permission request for tool call ${toolCallId} carries conflicting MCP metadata`)
+  }
   if (claimed.serverName !== undefined && claimed.serverName !== reported.serverName) return reject('MCP server name conflict')
   if (claimed.toolName !== undefined && claimed.toolName !== reported.toolName) return reject('tool name conflict')
+  if (claimed.name !== undefined && reported.name !== undefined && claimed.name !== reported.name) return reject('tool name conflict')
   if (reported.serverName !== MCP_SERVER_NAME) return reject(`unknown MCP server ${reported.serverName ?? '(none)'}`)
   const allowedTools = new Set([...state.advertisedToolNames, AWAIT_TOOL_NAME, CALL_TOOL_NAME])
   if (reported.toolName === undefined || !allowedTools.has(reported.toolName)) {

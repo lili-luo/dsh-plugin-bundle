@@ -15,6 +15,7 @@ import { classifyAgentNotice, toTokenUsage } from '../lib/conversation.js'
 import { EMPTY_INPUT_CONTINUATION, LOCKED_REPLAY_BUDGET_BYTES } from '../lib/history.js'
 import { assertSupportedAgyVersion, checkUnlock, prepareHome, resolveAgyBinary, resolvePythonArgv, syncOAuthToken } from '../lib/preflight.js'
 import { AntigravityRemote, INVOCATIONS } from '../lib/remote.js'
+import { answerPermission, recordReportedToolCall } from '../lib/tool-bridge.js'
 import {
   decodeGenMetadata, decodeStepMetadata,
   evaluateDegradeFingerprint, sessionDbPath,
@@ -641,6 +642,123 @@ test('permission gate rejects spoofed native tools and grants genuinely reported
   // once — never as allow_always.
   const probe = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'PROBECALL')] }))
   assert.match(textOf(probe), /PROBE_OK:allow-once/)
+})
+
+test('permission gate accepts agy 1.5.8 name-only MCP calls while rejecting unoffered, stale, and conflicting names', async () => {
+  const { adapter } = makeRuntime()
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S25_158', tools: [bash, read] }
+
+  // End-to-end: agy >= 1.5.8 sends `name: "mcp_dsh_<tool>"` and `title: "Run mcp_dsh_<tool>"`
+  // with no mcpServerName / mcpToolName / _meta.
+  const step1 = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'NAMEONLYCALL bash {"command":"pwd"}')] }))
+  assert.equal(finishOf(step1).reason.kind, 'tool-calls')
+  const [call] = callsOf(step1)
+  assert.equal(call.name, 'bash')
+  const resumed = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'NAMEONLYCALL bash {"command":"pwd"}'), assistantFrom('a1', step1), tool('t1', call.id, '/workspace')] }))
+  assert.equal(finishOf(resumed).reason.kind, 'stop')
+  assert.equal(textOf(resumed), 'RESULT(bash)=/workspace')
+
+  const warnings = []
+  const options = [{ optionId: 'allow', kind: 'allow_once' }, { optionId: 'deny', kind: 'reject_once' }]
+  const makeState = (reportedToolCalls, overrides = {}) => ({
+    sessionId: 's1',
+    tenantKey: 't1',
+    turnLive: true,
+    engineMode: 'bridge',
+    reportedToolCalls,
+    advertisedToolNames: new Set(['bash']),
+    ...overrides,
+  })
+
+  // Unit: both bridge and native modes accept `name: "mcp_dsh_bash"` once reported in session/update.
+  for (const engineMode of ['bridge', 'native']) {
+    const reported = new Map()
+    assert.equal(recordReportedToolCall({ reportedToolCalls: reported }, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_1',
+      name: 'mcp_dsh_bash',
+      kind: 'other',
+      title: 'Run mcp_dsh_bash',
+      rawInput: { command: 'pwd' },
+    }), 'created')
+    assert.equal(recordReportedToolCall({ reportedToolCalls: reported }, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_1',
+      name: 'mcp_dsh_bash',
+      kind: 'other',
+      status: 'pending',
+    }), 'merged')
+    const outcome = answerPermission(makeState(reported, { engineMode }), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_1', name: 'mcp_dsh_bash', kind: 'other', title: 'Run mcp_dsh_bash', rawInput: { command: 'pwd' } },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) })
+    assert.deepEqual(outcome, { outcome: 'selected', optionId: 'allow' })
+  }
+
+  // Built-in dsh_call_tool via agy 1.5.8 `name: "mcp_dsh_dsh_call_tool"` is also allowed.
+  {
+    const reported = new Map()
+    recordReportedToolCall({ reportedToolCalls: reported }, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_meta',
+      name: 'mcp_dsh_dsh_call_tool',
+      kind: 'other',
+      title: 'Run mcp_dsh_dsh_call_tool',
+    })
+    const outcome = answerPermission(makeState(reported), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_meta', name: 'mcp_dsh_dsh_call_tool', kind: 'other', title: 'Run mcp_dsh_dsh_call_tool' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) })
+    assert.deepEqual(outcome, { outcome: 'selected', optionId: 'allow' })
+  }
+
+  // Unoffered tool, unreported (stale) call, or mismatched claim/explicit fields must still be refused.
+  {
+    const reported = new Map()
+    recordReportedToolCall({ reportedToolCalls: reported }, { sessionUpdate: 'tool_call', toolCallId: 'call_unoffered', name: 'mcp_dsh_write', kind: 'other' })
+    assert.deepEqual(answerPermission(makeState(reported), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_unoffered', name: 'mcp_dsh_write', kind: 'other' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    assert.deepEqual(answerPermission(makeState(new Map()), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_stale', name: 'mcp_dsh_bash', kind: 'other' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    const mismatch = new Map()
+    recordReportedToolCall({ reportedToolCalls: mismatch }, { sessionUpdate: 'tool_call', toolCallId: 'call_ok', name: 'mcp_dsh_bash', kind: 'other' })
+    assert.deepEqual(answerPermission(makeState(mismatch), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_ok', name: 'mcp_dsh_read_file', kind: 'other' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    const selfConflict = new Map()
+    assert.equal(recordReportedToolCall({ reportedToolCalls: selfConflict }, {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_bad',
+      name: 'mcp_dsh_bash',
+      mcpToolName: 'read_file',
+      mcpServerName: 'dsh',
+    }), 'conflict')
+    assert.deepEqual(answerPermission(makeState(selfConflict), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_bad', name: 'mcp_dsh_bash' },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+
+    // Identity-less probe must NOT match when a non-MCP `name` is present.
+    assert.deepEqual(answerPermission(makeState(new Map()), {
+      sessionId: 's1',
+      toolCall: { toolCallId: 'call_builtin_probe', name: 'bash', kind: 'other', rawInput: {} },
+      options,
+    }, { hasHandshake: () => true, warn: m => warnings.push(m) }), { outcome: 'selected', optionId: 'deny' })
+  }
 })
 
 test('the permission gate binds the loading probe to a handshake and keeps identities across updates', async () => {
