@@ -97,7 +97,8 @@ export function sanitizeSystemPrompt(text) {
         .replace(/Tokens prefixed with @ are (?:workspace )?paths the user explicitly referenced\b[\s\S]*?quotes a path containing spaces\./g, FILE_REFERENCE_GUIDANCE)
         .replace(/You are an AI agent powered by DeepSeek Harness\./g, 'You are a coding agent in this session.')
         .replace(/The runtime context names the DeepSeek Harness implementation checkout\./g, 'The runtime context names the host checkout.')
-        .replace(/RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL\.[^\n]*/g, 'Requirement words keep their ordinary meaning.');
+        .replace(/RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL\.[^\n]*/g, 'Requirement words keep their ordinary meaning.')
+        .replace(/The browser provides no implicit DOM, route, or screenshot context\./g, 'The browser supplies no implicit DOM, route, or screenshot context.');
 }
 /**
  * Split leading system messages, the one-shot `system` field, and initial

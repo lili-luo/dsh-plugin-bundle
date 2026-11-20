@@ -9,6 +9,7 @@ import { join } from 'node:path'
 
 const FILE_REFERENCE = 'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host. A trailing slash marks a directory: list it when its contents matter. Anything else is a file: use the read tool when its contents are needed, and do not claim to have inspected it before reading. @"..." quotes a path containing spaces.'
 const RFC = "RFC 2119 keywords: MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL. 'NEVER' = 'MUST NOT'; 'AVOID' = 'SHOULD NOT'."
+const WEB_GUI = 'When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI. The browser provides no implicit DOM, route, or screenshot context. Starting another server does not update this GUI.'
 
 test('known fingerprint sentences are rewritten before any zero-width spacing', () => {
   const source = [
@@ -16,6 +17,7 @@ test('known fingerprint sentences are rewritten before any zero-width spacing', 
     FILE_REFERENCE,
     'The runtime context names the DeepSeek Harness implementation checkout. The checkout location stays separate.',
     RFC,
+    WEB_GUI,
     'Use `mcp_dsh_read` for files.',
   ].join('\n')
   const sanitized = sanitizeSystemPrompt(source)
@@ -23,6 +25,9 @@ test('known fingerprint sentences are rewritten before any zero-width spacing', 
   assert.doesNotMatch(sanitized, /powered by DeepSeek Harness/)
   assert.doesNotMatch(sanitized, /DeepSeek Harness implementation checkout/)
   assert.doesNotMatch(sanitized, /RFC 2119 keywords/)
+  assert.doesNotMatch(sanitized, /The browser provides no implicit DOM, route, or screenshot context\./)
+  assert.match(sanitized, /The browser supplies no implicit DOM, route, or screenshot context\./)
+  assert.match(sanitized, /they mean this GUI\. The browser supplies .*Starting another server does not update this GUI\./)
   assert.match(sanitized, /以 @ 开头的标记是用户显式引用的路径/)
   assert.match(sanitized, /`mcp_dsh_read`/)
   assert.match(sanitized, /The checkout location stays separate/)

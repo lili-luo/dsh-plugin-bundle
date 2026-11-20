@@ -9,7 +9,7 @@
  * @module dsh-llm-antigravity-acp
  */
 import { homedir } from 'node:os';
-import { accountVisibleModels } from "./accounts.js";
+import { accountVisibleModels, cliEnv } from "./accounts.js";
 import { AntigravityAdapter } from "./adapter.js";
 import { FALLBACK_MODELS } from "./catalog.js";
 import { current } from "./config.js";
@@ -130,14 +130,13 @@ export function apply(ctx, config) {
     // Every account runs the CLI under its own `$HOME`, which is what keeps its
     // credential store separate; callers pass that overlay, and an omitted
     // overlay keeps the legacy behaviour of running under the real home.
-    const systemEnv = { HOME: homedir() };
     const spawnAcp = (argv, cwd, env) => {
         const handle = subprocess.spawn({
             argv,
             cwd,
             stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 64 * 1024 } },
             graceMs: 5_000,
-            env: env ?? systemEnv,
+            env: cliEnv(env),
         });
         if (handle.stdin === undefined || handle.stdout === undefined)
             throw new Error('antigravity-acp: ACP process has no stdio pipes');
@@ -156,7 +155,7 @@ export function apply(ctx, config) {
             stdio: { stdin: 'ignore', stdout: { maxBytes: 8 * 1024 * 1024 }, stderr: { maxBytes: 256 * 1024 } },
             graceMs: 3_000,
             signal: AbortSignal.timeout(timeoutMs),
-            env: { ...(env ?? systemEnv), PYTHONUTF8: '1' },
+            env: { ...cliEnv(env), PYTHONUTF8: '1' },
         });
         const outcome = await handle.done;
         return {

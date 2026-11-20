@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  AccountPool, accountEnv, buildLayouts, emailFromToken, ensureLayout, ensureLoginKeychain,
+  AccountPool, accountEnv, buildLayouts, cliEnv, emailFromToken, ensureLayout, ensureLoginKeychain,
   familyForModel, loginCommand, parseResetTime, readAccountEmail, SYSTEM_ACCOUNT_ID,
 } from '../lib/accounts.js'
 
@@ -95,6 +95,33 @@ test('accountEnv isolates HOME and never lets a profile override it', () => {
   const linux = accountEnv(work, 'linux')
   assert.equal(linux.HOME, '/base/accounts/work/home')
   assert.equal(linux.DBUS_SESSION_BUS_ADDRESS, 'unix:path=/base/accounts/work/.no-dbus-session')
+})
+
+test('cliEnv lists the Windows profile variables explicitly and keeps credentials out', () => {
+  const parent = {
+    USERPROFILE: 'C:\\Users\\me',
+    APPDATA: 'C:\\Users\\me\\AppData\\Roaming',
+    LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local',
+    SystemRoot: 'C:\\Windows',
+    Path: 'C:\\Windows\\system32',
+    DEEPSEEK_API_KEY: 'sk-secret',
+    DSH_HOME: 'C:\\Users\\me\\.dsh',
+  }
+  const machine = cliEnv(undefined, 'win32', parent)
+  assert.equal(machine.USERPROFILE, 'C:\\Users\\me')
+  assert.equal(machine.APPDATA, 'C:\\Users\\me\\AppData\\Roaming')
+  assert.equal(machine.LOCALAPPDATA, 'C:\\Users\\me\\AppData\\Local')
+  assert.equal(machine.SystemRoot, 'C:\\Windows')
+  assert.equal(machine.Path, 'C:\\Windows\\system32')
+  assert.equal(machine.HOME, homedir())
+  assert.equal(machine.DEEPSEEK_API_KEY, undefined)
+  assert.equal(machine.DSH_HOME, undefined)
+  const overlay = cliEnv({ HOME: 'C:\\pool\\work\\home', HTTPS_PROXY: 'http://p' }, 'win32', parent)
+  assert.equal(overlay.HOME, 'C:\\pool\\work\\home')
+  assert.equal(overlay.HTTPS_PROXY, 'http://p')
+  assert.equal(overlay.USERPROFILE, 'C:\\Users\\me')
+  assert.deepEqual(cliEnv(undefined, 'darwin', parent), { HOME: homedir() })
+  assert.deepEqual(cliEnv({}, 'linux', parent), {})
 })
 
 test('loginCommand quotes paths and scopes HOME only for sandboxed accounts', () => {

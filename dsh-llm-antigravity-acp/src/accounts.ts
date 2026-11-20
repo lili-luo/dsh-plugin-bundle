@@ -495,6 +495,42 @@ export function accountEnv(layout: AccountLayout, platform: NodeJS.Platform = pr
 }
 
 /**
+ * Upper-cased names Windows programs read to locate the user profile, application data, temporary,
+ * and system directories. `agy` resolves its home from `%USERPROFILE%`, not `$HOME`, and exits with
+ * "%userprofile% is not defined" without it.
+ */
+const WINDOWS_PROFILE_ENV = new Set([
+  'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA',
+  'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'TEMP', 'TMP', 'PATH', 'PATHEXT', 'COMSPEC',
+])
+
+/**
+ * Explicit environment entries for one CLI process.
+ *
+ * The subprocess service merges these entries over its scrubbed parent environment. On Windows the
+ * profile variables are listed explicitly as well, so the CLI finds its login and settings even when
+ * a subprocess provider applies only the explicit entries. Credential-shaped parent names are never
+ * copied here and stay subject to the service's scrub.
+ * @param overlay - account overlay from {@link accountEnv}; undefined runs under the real `$HOME`.
+ * @param platform - target platform, injectable for tests.
+ * @param parent - parent environment, injectable for tests.
+ * @returns the environment entries handed to the spawn.
+ */
+export function cliEnv(
+  overlay: NodeJS.ProcessEnv | undefined,
+  platform: NodeJS.Platform = process.platform,
+  parent: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = {}
+  if (platform === 'win32') {
+    for (const [key, value] of Object.entries(parent)) {
+      if (value !== undefined && WINDOWS_PROFILE_ENV.has(key.toUpperCase())) base[key] = value
+    }
+  }
+  return overlay === undefined ? { ...base, HOME: homedir() } : { ...base, ...overlay }
+}
+
+/**
  * Shell command that signs one account in from a terminal.
  * @param layout - account layout.
  * @param binary - `agy` executable path.

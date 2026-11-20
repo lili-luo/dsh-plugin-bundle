@@ -12,7 +12,7 @@
 import { homedir } from 'node:os'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { accountVisibleModels } from './accounts.ts'
+import { accountVisibleModels, cliEnv } from './accounts.ts'
 import { AntigravityAdapter } from './adapter.ts'
 import type { AcpSpawner } from './acp-process.ts'
 import { FALLBACK_MODELS } from './catalog.ts'
@@ -160,15 +160,13 @@ export function apply(ctx: Context, config: Config): void {
   // Every account runs the CLI under its own `$HOME`, which is what keeps its
   // credential store separate; callers pass that overlay, and an omitted
   // overlay keeps the legacy behaviour of running under the real home.
-  const systemEnv = { HOME: homedir() }
-
   const spawnAcp: AcpSpawner = (argv, cwd, env) => {
     const handle = subprocess.spawn({
       argv,
       cwd,
       stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 64 * 1024 } },
       graceMs: 5_000,
-      env: env ?? systemEnv,
+      env: cliEnv(env),
     })
     if (handle.stdin === undefined || handle.stdout === undefined) throw new Error('antigravity-acp: ACP process has no stdio pipes')
     return {
@@ -190,7 +188,7 @@ export function apply(ctx: Context, config: Config): void {
       stdio: { stdin: 'ignore', stdout: { maxBytes: 8 * 1024 * 1024 }, stderr: { maxBytes: 256 * 1024 } },
       graceMs: 3_000,
       signal: AbortSignal.timeout(timeoutMs),
-      env: { ...(env ?? systemEnv), PYTHONUTF8: '1' },
+      env: { ...cliEnv(env), PYTHONUTF8: '1' },
     })
     const outcome = await handle.done
     return {

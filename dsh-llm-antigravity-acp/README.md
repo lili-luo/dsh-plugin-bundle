@@ -21,14 +21,14 @@ flowchart LR
 
 | 环节 | 做法 |
 |---|---|
-| 进程 | 由 `ctx.subprocess` 启动本机官方 `agy acp`，凭据留在官方进程与系统凭据库（macOS 钥匙串 / Windows 凭据管理器） |
+| 进程 | 由 `ctx.subprocess` 启动本机官方 `agy acp`，凭据留在官方进程与系统凭据库（macOS 钥匙串 / Windows 凭据管理器）；Windows 下显式传入 `USERPROFILE`、`APPDATA`、`LOCALAPPDATA`、`SystemRoot`、`PATH` 等用户目录与系统目录变量 |
 | 客户端标识 | ACP `clientInfo` 使用官方客户端标识 `antigravity`，版本取 `agy --version` 的 `major.minor.patch`（读不到时为 `1.5.5`）；`agy acp` 启动参数带 `--override_user_agent_name antigravity`，Cloud Code 请求的 `User-Agent` 与官方客户端一致 |
 | 隔离 | 独立 `--gemini-dir`（默认 `$DSH_HOME/cache/antigravity-acp`），预置 `settings.json` 默认 `"Gemini 4 Argon (High)"` 与 `"512K"`，并从本机 `~/.gemini/config/config.json`（`userSettings.useAiCredits`）与 `~/.gemini/antigravity-cli/settings.json` 同步 Google One AI Credits 开关；预置 `config/projects/default-cli-project.json`（消除每步的 `project_store_get_file_missing`）与 `agy/cache`、`antigravity-cli/cache` 下已完成的 `onboarding.json`。默认 `bridge` 模式以 `dsh-bridge` agent（`tools: []` + `excludeDefaultComponents: true`）去掉全部内置文件/终端工具；切换为 `native` 模式时不传 `--agent`，保留 Antigravity 原生 `<identity>` 与内置工具。多账号时每个账号另有独立 `$HOME` 与独立凭据沙箱，见下节 |
 | 引擎模式 | `engineMode` 支持 `bridge`（默认，DSH 工具桥接）与 `native`（原生 Agent 满血模式），可在设置页即时切换并自动重启活跃 ACP 进程。`native` 模式下会话 `cwd` 直接绑定当前工作区目录，自动过滤重叠的 DSH 文件/终端工具（`read`、`write`、`edit`、`bash`、`glob`、`grep`、`working_directory`、`job_*`、`*_mcp_resource*`），保留全部 DSH 子代理、Team、Workflow、Skill、`todo_write`、`ask_user_question`、`present`、Goal、Schedule、Web 与自定义插件工具；`agy` 内置工具权限严格对齐当前 DSH `sandbox:policy`（`read-only` / `workspace-write` 路径与软链边界校验 / `danger-full-access`），内置工具步骤实时以 `[agy]` 摘要写入思考流 |
 | 工具 | DSH 工具经每会话独立的 MCP 端点暴露为 `mcp_dsh_<name>`，超出 eager 阈值的工具完整描述同步写入 `<harness_tool_contracts>`；声明 `toolUpdate: in-history`，中途动态增删工具通过 `<harness_tool_update>` 与 `dsh_call_tool` 原地执行，让同一 ACP 会话的前缀保持稳定 |
 | 长时工具 | agy 对单次 MCP 调用有 180 秒上限且 Gemini 隐式缓存存在空闲 TTL；默认超过 85 秒（`relayAfterMs`）的调用先返回“仍在运行”提示，模型调用 `dsh_await_result` 继续等待同一结果并刷新缓存活跃度，DSH 侧只看到一次工具调用 |
 | 历史 | 同一 DSH 会话持续复用同一 ACP 会话，并在 `session-index.json` 持久化绑定，空闲回收或 DSH 重启后经原生 `session/load` 恢复原 SQLite 会话与 `thoughtSignature`；仅在上下文压缩或历史改写时以 `<dsh_history>` 转录重建（解锁时预算 2.2MB，未解锁时 160KB） |
-| 系统提示 | 首次经 `_meta.antigravity.systemPrompt.append` 注入，同时将首轮 `AGENTS.md`（`agent-instructions`）提升至 `<user_rules>` 系统级槽位；声明 `systemPromptUpdate: in-history`，后续变化作为 `<system_update>` 增量发送。`bridge` 模式的隔离 agent 带 Antigravity `<identity>` 头。送出前会改写已知会触发上游特征匹配的英文句子（`@` 路径说明、Harness 身份句、RFC 2119 首行），并在系统提示词与工具描述的散文单词中插入零宽空格；工具名、参数名、代码片段和路径保持原样 |
+| 系统提示 | 首次经 `_meta.antigravity.systemPrompt.append` 注入，同时将首轮 `AGENTS.md`（`agent-instructions`）提升至 `<user_rules>` 系统级槽位；声明 `systemPromptUpdate: in-history`，后续变化作为 `<system_update>` 增量发送。`bridge` 模式的隔离 agent 带 Antigravity `<identity>` 头。送出前会改写已知会触发上游特征匹配的英文句子（`@` 路径说明、Harness 身份句、RFC 2119 首行、Web GUI 段落的 `The browser provides no implicit DOM…` 句），并在系统提示词与工具描述的散文单词中插入零宽空格；工具名、参数名、代码片段和路径保持原样 |
 
 > 背景：早期 Antigravity ACP 服务按 `clientInfo.name` 白名单下发第三方模型（[antigravity-cli#1318](https://github.com/google-antigravity/antigravity-cli/issues/1318)）；实测 `agy` 1.5.5 对 `antigravity`、`jetbrains.dsh` 与任意名称均下发 Claude 与 GPT-OSS。插件在 ACP 握手里使用官方客户端标识，不修改官方二进制，也不接管登录态。模型与套餐矩阵见 [Choose a model](https://antigravity.google/docs/models/)。
 
