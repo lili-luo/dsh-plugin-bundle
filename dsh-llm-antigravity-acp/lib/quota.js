@@ -12,7 +12,7 @@
  * @module dsh-llm-antigravity-acp/quota
  */
 import { SYSTEM_ACCOUNT_ID } from "./accounts.js";
-import { inspectCloudCodeAccount, } from "./cloudcode.js";
+import { inspectCloudCodeAccount, VerificationRequiredError, } from "./cloudcode.js";
 /**
  * Whether one window is the weekly (7-day) bucket. Upstream either names the
  * window `weekly` or encodes it in the bucket id (`gemini-weekly`, `3p-7d`), so
@@ -251,6 +251,18 @@ export class QuotaReader {
                 }
             }
             catch (cloudError) {
+                // Google wants the owner to verify the account: `agy /usage` would
+                // only hide the demand and its link, so report it as-is.
+                if (cloudError instanceof VerificationRequiredError) {
+                    return {
+                        status: 'error',
+                        updatedAt: new Date().toISOString(),
+                        groups: this.cached.get(accountId)?.snapshot.groups ?? [],
+                        error: cloudError.message,
+                        verificationRequired: true,
+                        ...(cloudError.verificationUrl !== undefined ? { verificationUrl: cloudError.verificationUrl } : {}),
+                    };
+                }
                 // Fall through to `agy -p /usage` if available; otherwise report the Cloud Code error.
                 const binary = this.binary();
                 if (binary === undefined) {

@@ -61,11 +61,11 @@ flowchart LR
 | 登录 | 设置页点「登录」后插件以该账号沙箱启动 `agy acp --login`，把授权 URL 显示在面板里；浏览器授权后把授权码粘回面板即可完成，登录态由 `agy` 自己写入该账号钥匙串。面板里的**授权链接**和**终端命令**各自带一个复制按钮（复制成功后按钮转为绿色对勾），终端命令可作为兜底手动执行 |
 | 账号来源 | `accounts` 列表就是账号的唯一来源：列表里带 `system: true` 的条目即「本机」账号（默认 id `default`），直接复用这台机器现有的登录与钥匙串，并始终启用；列表里没有这一条，就表示本机账号已被移除。其余账号同样由 `accounts` 声明 |
 | 调度 | 会话粘性：同一 DSH 会话固定在一个账号上，保住 Gemini 隐式上下文缓存；新会话落到最久未使用的账号；配额耗尽按**模型族**独立冷却（A 号 Claude 打满不影响 A 号继续跑 Gemini） |
-| 切换 | 只在**尚未吐出任何内容**时切换，按失败类型处理：额度耗尽给该账号打上该族的冷却（有重置时间就用到重置时间，否则 10 分钟）；瞬时限流只冷却上游给出的等待时长或 60 秒，没有其他账号能接时保持账号可用，把原始错误连同 retry-after 交给 `dsh-llm-retry` 重试；降级线路的自动重答交给请求重试层处理，账号保持可用、不换号。换号后按 DSH 权威历史重建 ACP 会话继续同一步；已经产生输出的步骤不会重试，避免重复内容。所有账号都不可用时，报错逐个列出原因（未开通该模型、剩余冷却时间与触发冷却的原始错误、已停用），并携带最短剩余冷却作为 retry-after，冷却超过 10 秒时 DSH 直接结束重试 |
+| 切换 | 只在**尚未吐出任何内容**时切换，按失败类型处理：额度耗尽给该账号打上该族的冷却（有重置时间就用到重置时间，否则 10 分钟）；瞬时限流只冷却上游给出的等待时长或 60 秒，没有其他账号能接时保持账号可用，把原始错误连同 retry-after 交给 `dsh-llm-retry` 重试；上游要求 Google 账号验证（403 `VALIDATION_REQUIRED`）时标记该账号待验证并切换至其他可用账号，全部可用账号均待验证时以 `AUTH` 报错并提示前往设置页验证，完成验证后下次对话或点击「已验证，重新检查」即可恢复；降级线路的自动重答交给请求重试层处理，账号保持可用、不换号。换号后按 DSH 权威历史重建 ACP 会话继续同一步；已经产生输出的步骤不会重试，避免重复内容。所有账号都不可用时，报错逐个列出原因（未开通该模型、待 Google 验证、剩余冷却时间与触发冷却的原始错误、已停用），并携带最短剩余冷却作为 retry-after，冷却超过 10 秒时 DSH 直接结束重试 |
 | 内存 | 只有正在服务的账号持有 `agy acp` 前置进程，其余账号空闲后由回收器停掉（同一 `idleSessionTtlMs` 窗口），因此账号数不线性增加常驻内存 |
 | 额度归属 | 药丸不再回答「上一个跑过的是谁」，而是按当前模型走调度器同一套规则（优先级/权重/会话粘性/账号自报目录/冷却）选出服务账号，只读该账号的窗口；账号自报目录里没有该模型时判为未开通，绝不拿同账号另一模型族的百分比顶替 |
 
-在设置页的 Antigravity 卡片里可以：查看每个账号的邮箱、状态、冷却与在用会话数，启用/停用、添加、删除，以及逐个登录。
+在设置页的 Antigravity 卡片里可以：查看每个账号的邮箱、状态、冷却与在用会话数，启用/停用、添加、删除，以及逐个登录。当 Cloud Code PA 接口返回 `403 VALIDATION_REQUIRED` 或对话触发 `Verify your account` 时，对应账号卡片会显示「需要验证」徽标、「去验证」按钮（调用系统浏览器打开验证页）、可复制的验证链接及「已验证，重新检查」按钮。
 
 ## 安装
 
@@ -146,4 +146,4 @@ npm run build && npm test
 
 测试使用 `tests/fake-agy.mjs` 模拟 `agy acp` 与 MCP 客户端，覆盖流式思考与正文、精确用量、工具挂起与回填、并行工具、会话复用与重建、子代理并发、长时工具续等、追加输入、取消、长输出续写、辅助会话与图片输入。
 
-多账号另有独立覆盖：`tests/accounts.test.mjs` 校验账号沙箱布局、环境隔离、空密码钥匙串创建与调度器（会话粘性、按族冷却、LRU 轮转）；`tests/multi-account.test.mjs` 端到端验证「某账号配额耗尽后同一步换号续跑」「冷却按模型族隔离」「池内全部耗尽时明确报错」「额度药丸读取服务该模型的账号」「Pro 账号对 Argon 显示未开通」；`tests/quota-focus.test.mjs` 逐条覆盖模型族与账号权限窗口的解析（Pro/Ultra、独立 Argon 桶、共享池、缺权限、旧版无权限信息）；`tests/failover-classification.test.mjs` 覆盖瞬时限流短冷却后换号、唯一账号限流时交还原始错误与 retry-after、降级线路失败时账号保持可用、不换号；`tests/pool-exhausted.test.mjs` 覆盖全部不可用时的逐账号原因与 retry-after；`tests/degrade-fingerprint.test.mjs` 用真实会话回放校验 2048 分块缓存单独出现时不判降级，并校验 Carbon 与 Argon 走同一指纹；`tests/degrade-policy.test.mjs` 覆盖三档 `degradeAction`、Carbon 拦截与设置页即时切换；`tests/bridge-output-bound.test.mjs` 覆盖 `read` 分页与其他工具头尾截取后结果始终不超过 9,600 字节；`tests/native-engine.test.mjs` 覆盖 `engineMode: 'native'` 的参数切换、工作区 `cwd` 绑定、非重叠 MCP 工具过滤、多轮增量续写、`read-only` / `workspace-write` / `danger-full-access` 权限与软链边界校验、内置工具思考流摘要及 `useAiCredits` 同步；`tests/config-boot.test.mjs` 覆盖启动写回（首次写入、已是最新配置时跳过、写入失败只告警）、账号列表改动即时生效，以及账号列表为空时启动、报 `AUTH` 与重新加入账号后恢复服务。
+多账号另有独立覆盖：`tests/accounts.test.mjs` 校验账号沙箱布局、环境隔离、空密码钥匙串创建与调度器（会话粘性、按族冷却、LRU 轮转）；`tests/multi-account.test.mjs` 端到端验证「某账号配额耗尽后同一步换号续跑」「冷却按模型族隔离」「池内全部耗尽时明确报错」「额度药丸读取服务该模型的账号」「Pro 账号对 Argon 显示未开通」；`tests/quota-focus.test.mjs` 逐条覆盖模型族与账号权限窗口的解析（Pro/Ultra、独立 Argon 桶、共享池、缺权限、旧版无权限信息）；`tests/failover-classification.test.mjs` 覆盖瞬时限流短冷却后换号、唯一账号限流时交还原始错误与 retry-after、降级线路失败时账号保持可用、不换号；`tests/pool-exhausted.test.mjs` 覆盖全部不可用时的逐账号原因与 retry-after；`tests/verification.test.mjs` 覆盖 Google `403 VALIDATION_REQUIRED` 验证链接校验、不回退 `agy /usage`、`AUTH` 错误归类、多账号换号与单账号验证后自动恢复；`tests/degrade-fingerprint.test.mjs` 用真实会话回放校验 2048 分块缓存单独出现时不判降级，并校验 Carbon 与 Argon 走同一指纹；`tests/degrade-policy.test.mjs` 覆盖三档 `degradeAction`、Carbon 拦截与设置页即时切换；`tests/bridge-output-bound.test.mjs` 覆盖 `read` 分页与其他工具头尾截取后结果始终不超过 9,600 字节；`tests/native-engine.test.mjs` 覆盖 `engineMode: 'native'` 的参数切换、工作区 `cwd` 绑定、非重叠 MCP 工具过滤、多轮增量续写、`read-only` / `workspace-write` / `danger-full-access` 权限与软链边界校验、内置工具思考流摘要及 `useAiCredits` 同步；`tests/config-boot.test.mjs` 覆盖启动写回（首次写入、已是最新配置时跳过、写入失败只告警）、账号列表改动即时生效，以及账号列表为空时启动、报 `AUTH` 与重新加入账号后恢复服务。

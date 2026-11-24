@@ -381,6 +381,7 @@ window.__ModuleLoader__.load({
       '.dsh-agy-dot{display:inline-block;width:7px;height:7px;border-radius:999px;flex:0 0 auto}',
       '.dsh-agy-badge{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;font-size:11px;line-height:18px;font-weight:500;white-space:nowrap;background:var(--dsw-alias-bg-module-platform, color-mix(in srgb, currentColor 6%, transparent));color:var(--dsw-alias-label-primary)}',
       '.dsh-agy-badge-system{padding:1px 7px;font-size:11px;background:color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 12%, transparent);color:var(--dsw-alias-state-business-primary, #4176e6)}',
+      '.dsh-agy-badge-verify{padding:1px 8px;font-size:11px;background:color-mix(in srgb, #e0a800 16%, transparent);color:var(--dsw-alias-state-warning-primary, #b45309)}',
       '.dsh-agy-tier{display:inline-flex;align-items:center;padding:1px 8px;border-radius:999px;font-size:11px;line-height:18px;font-weight:500;letter-spacing:0.02em;white-space:nowrap;background:var(--dsw-alias-bg-module-platform, color-mix(in srgb, currentColor 7%, transparent));color:var(--dsw-alias-label-secondary, var(--dsw-alias-label-primary))}',
       '.dsh-agy-tier-ultra{background:color-mix(in srgb, #7c3aed 13%, transparent);color:#7c3aed}',
       '.dsh-agy-tier-pro{background:color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 13%, transparent);color:var(--dsw-alias-state-business-primary, #4176e6)}',
@@ -965,6 +966,18 @@ window.__ModuleLoader__.load({
       const running = (kind) => props.runningKind === kind
       const ticket = props.ticket
       const cooldowns = Array.isArray(row.cooldowns) ? row.cooldowns : []
+      // Google's 403 VALIDATION_REQUIRED: the host probes it at start-up and on
+      // every quota read; a fresh quota answer here wins over the cached row.
+      const quotaSaysOk = !!props.quota && props.quota.status === 'ok'
+      const needsVerify = !quotaSaysOk && (row.verificationRequired === true || (!!props.quota && props.quota.verificationRequired === true))
+      const verifyUrl = (props.quota && props.quota.verificationUrl) || row.verificationUrl || ''
+      const openVerify = () => {
+        if (verifyUrl && typeof window !== 'undefined' && typeof window.open === 'function') {
+          window.open(verifyUrl, '_blank', 'noopener,noreferrer')
+        } else {
+          props.onRefreshQuota()
+        }
+      }
       const removeStyle = { padding: '4px 10px', color: '#d9534f', borderColor: 'color-mix(in srgb, #d9534f 30%, transparent)' }
       // Removing the machine account drops this Mac's own login from the list,
       // so it asks once inline before the list is submitted. A declared account
@@ -1011,7 +1024,11 @@ window.__ModuleLoader__.load({
                   }, accountTitle(row)),
                 system ? h('span', { className: 'dsh-agy-badge dsh-agy-badge-system' }, t('Default', '默认')) : null,
                 tierBadge(row.subscriptionTier || (props.quota && props.quota.subscriptionTier), row.subscriptionName || (props.quota && props.quota.subscriptionName)),
-                schedBadge(row)),
+                schedBadge(row),
+                needsVerify ? h('span', {
+                  className: 'dsh-agy-badge dsh-agy-badge-verify',
+                  'data-agy-verify': 'required',
+                }, t('Verification required', '需要验证')) : null),
               h('div', { className: 'dsh-agy-account-sub' },
                 (!system && !remarkOf(row) && signedIn(row))
                   ? null
@@ -1023,6 +1040,12 @@ window.__ModuleLoader__.load({
                     ? h('span', {}, t('All global models', '跟随全局模型'))
                     : null)))),
           h('div', { className: 'dsh-agy-account-actions' },
+            needsVerify ? h(SmallButton, {
+              variant: 'primary',
+              className: 'dsh-agy-btn-row',
+              disabled: busy || props.quotaLoading === true,
+              onClick: openVerify,
+            }, props.quotaLoading === true ? '…' : verifyUrl ? t('Verify', '去验证') : t('Get link', '获取验证链接')) : null,
             (system || signedIn(row)) ? h('button', {
               type: 'button',
               className: 'dsh-agy-btn dsh-agy-btn-row',
@@ -1045,7 +1068,19 @@ window.__ModuleLoader__.load({
         cooldowns.length > 0 ? h('div', { className: 'dsh-agy-cooldowns' },
           ...cooldowns.map((entry) => h('span', { key: String(entry.family), 'data-agy-cooldown': entry.family },
             t(`${accountFamilyLabel(entry.family)} paused ${cooldownLabel(entry.until)}`, `${accountFamilyLabel(entry.family)} 冷却 ${cooldownLabel(entry.until)}`)))) : null,
-        row.error ? h('div', { role: 'alert', className: 'dsh-agy-account-error' }, row.error) : null,
+        row.error && !(needsVerify && /VALIDATION_REQUIRED|verify your account/i.test(String(row.error)))
+          ? h('div', { role: 'alert', className: 'dsh-agy-account-error' }, row.error)
+          : null,
+        needsVerify ? h('div', { role: 'alert', className: 'dsh-agy-ticket', 'data-agy-verify': 'panel' },
+          h('div', { className: 'dsh-agy-row-alert' },
+            t('Google asks you to verify this account before it can serve again. Finish it in the browser, then recheck.',
+              'Google 要求先验证这个账号才能继续使用。在浏览器里完成验证后，点「已验证，重新检查」。')),
+          verifyUrl ? h('div', { className: 'dsh-agy-ticket-row', 'data-agy-ticket': 'verify-link' },
+            h('a', { href: verifyUrl, target: '_blank', rel: 'noreferrer', className: 'dsh-agy-ticket-link' }, verifyUrl),
+            h(CopyButton, { kind: 'link', text: verifyUrl, label: t('Copy verification link', '复制验证链接') })) : null,
+          h('div', { className: 'dsh-agy-inline-row-wrap' },
+            h(SmallButton, { disabled: busy || props.quotaLoading === true, onClick: () => props.onRefreshQuota() },
+              props.quotaLoading === true ? '…' : t('Verified, recheck', '已验证，重新检查')))) : null,
         // Inline sign-in hand-off: authorization link, terminal fallback, and
         // an equal-height code field + primary submit + cancel cluster. Both
         // read-only lines carry their own copy action — each one is a wall of
@@ -1474,7 +1509,8 @@ window.__ModuleLoader__.load({
         remember(setQuotaLoading, row.id, true)
         props.client.quota({ accountId: row.id, force: force === true }).then((snapshot) => {
           setQuotas((prev) => ({ ...prev, [row.id]: snapshot }))
-          if (snapshot && snapshot.status === 'ok' && (snapshot.subscriptionTier || snapshot.availableModels)) {
+          if (snapshot && (snapshot.verificationRequired === true || row.verificationRequired === true
+            || (snapshot.status === 'ok' && (snapshot.subscriptionTier || snapshot.availableModels)))) {
             props.client.status().then((next) => {
               if (typeof props.onStatus === 'function') props.onStatus(next)
             }).catch(() => undefined)

@@ -188,7 +188,7 @@ const flush = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-function loadClientPlugin({ language = 'zh-CN', remoteService, sessions, uiWorkspace, clipboard } = {}) {
+function loadClientPlugin({ language = 'zh-CN', remoteService, sessions, uiWorkspace, clipboard, onOpen } = {}) {
   const { React, mount } = createMiniReact()
   const listeners = new Map()
   const document = {
@@ -206,6 +206,7 @@ function loadClientPlugin({ language = 'zh-CN', remoteService, sessions, uiWorks
 
   let loadedSpec = null
   const window = {
+    ...(onOpen === undefined ? {} : { open: onOpen }),
     __ModuleLoader__: {
       load(spec) {
         loadedSpec = spec
@@ -2114,5 +2115,74 @@ test('QuotaPill asks about the model on screen and drops a late answer for the p
   })
   await flush()
   assert.equal(textOf(findOne(view.tree, (n) => n.tag === 'button')), '周 46%', 'a stale answer never repaints the current model')
+  view.unmount()
+})
+
+test('AccountCard surfaces Google verification badge, Verify action, copyable link, and clears on recheck', async () => {
+  const verifyUrl = 'https://accounts.google.com/v3/signin/continue?plt=TEST'
+  const opened = []
+  const copied = []
+  let verified = false
+  const makeAccounts = () => ([
+    accountRow('acc-verify', {
+      label: 'Test Account',
+      email: 'verify@example.com',
+      error: verified ? undefined : 'Verify your account to continue.',
+      verificationRequired: !verified,
+      verificationUrl: verified ? undefined : verifyUrl,
+    }),
+  ])
+
+  const { registered, mount } = loadClientPlugin({
+    language: 'zh-CN',
+    onOpen: (url, target, features) => { opened.push({ url, target, features }) },
+    clipboard: { writeText: async (text) => { copied.push(text) } },
+    remoteService: {
+      status: async () => accountsStatus(makeAccounts()),
+      accounts: async () => makeAccounts(),
+      quota: async () => verified
+        ? { status: 'ok', updatedAt: new Date(FIXED_NOW).toISOString(), groups: [] }
+        : {
+          status: 'error',
+          updatedAt: new Date(FIXED_NOW).toISOString(),
+          groups: [],
+          error: 'Verify your account to continue.',
+          verificationRequired: true,
+          verificationUrl: verifyUrl,
+        },
+    },
+  })
+
+  const slot = registered.get('settings.section')
+  const view = mount(slot.Component, slot.meta.inject())
+  await flush()
+
+  const card = findOne(view.tree, (n) => n.props && n.props['data-agy-account'] === 'acc-verify')
+  assert.ok(findOne(card, (n) => n.props && n.props['data-agy-verify'] === 'required' && textOf(n) === '需要验证'))
+  assert.equal(findOne(card, (n) => n.props && n.props.className === 'dsh-agy-account-error'), null,
+    'duplicate raw verification row.error is suppressed when the verification panel is shown')
+  assert.ok(findOne(card, (n) => n.props && n.props['data-agy-verify'] === 'panel'))
+  assert.ok(findOne(card, (n) => n.props && n.props['data-agy-ticket'] === 'verify-link'))
+
+  const verifyBtn = findOne(card, (n) => n.tag === 'button' && textOf(n) === '去验证')
+  assert.ok(verifyBtn)
+  verifyBtn.props.onClick()
+  assert.deepEqual(opened, [{ url: verifyUrl, target: '_blank', features: 'noopener,noreferrer' }])
+
+  const copyBtn = findOne(card, (n) => n.tag === 'button' && n.props['aria-label'] === '复制验证链接')
+  assert.ok(copyBtn)
+  copyBtn.props.onClick()
+  await flush()
+  assert.deepEqual(copied, [verifyUrl])
+
+  verified = true
+  const recheckBtn = findOne(card, (n) => n.tag === 'button' && textOf(n) === '已验证，重新检查')
+  assert.ok(recheckBtn)
+  recheckBtn.props.onClick()
+  await flush()
+
+  const updatedCard = findOne(view.tree, (n) => n.props && n.props['data-agy-account'] === 'acc-verify')
+  assert.equal(findOne(updatedCard, (n) => n.props && n.props['data-agy-verify'] === 'required'), null)
+  assert.equal(findOne(updatedCard, (n) => n.props && n.props['data-agy-verify'] === 'panel'), null)
   view.unmount()
 })

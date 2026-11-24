@@ -16,6 +16,7 @@ import { SYSTEM_ACCOUNT_ID, type AccountLayout } from './accounts.ts'
 import type { CatalogModel } from './catalog.ts'
 import {
   inspectCloudCodeAccount,
+  VerificationRequiredError,
   type CloudCodeTransport,
   type SubscriptionTier,
 } from './cloudcode.ts'
@@ -59,6 +60,10 @@ export interface QuotaSnapshot {
   updatedAt: string
   groups: QuotaGroup[]
   error?: string
+  /** Google asks the owner to verify this account (Cloud Code 403 `VALIDATION_REQUIRED`). */
+  verificationRequired?: boolean
+  /** Browser link that clears the verification, when upstream gave one. */
+  verificationUrl?: string
   /** Authoritative subscription tier from `loadCodeAssist`. */
   subscriptionTier?: SubscriptionTier
   /** Human-readable subscription plan name (e.g. `Google AI Ultra`, `Google AI Pro`). */
@@ -337,6 +342,18 @@ export class QuotaReader {
           return snapshot
         }
       } catch (cloudError) {
+        // Google wants the owner to verify the account: `agy /usage` would
+        // only hide the demand and its link, so report it as-is.
+        if (cloudError instanceof VerificationRequiredError) {
+          return {
+            status: 'error',
+            updatedAt: new Date().toISOString(),
+            groups: this.cached.get(accountId)?.snapshot.groups ?? [],
+            error: cloudError.message,
+            verificationRequired: true,
+            ...(cloudError.verificationUrl !== undefined ? { verificationUrl: cloudError.verificationUrl } : {}),
+          }
+        }
         // Fall through to `agy -p /usage` if available; otherwise report the Cloud Code error.
         const binary = this.binary()
         if (binary === undefined) {

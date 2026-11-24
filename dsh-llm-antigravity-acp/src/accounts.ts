@@ -170,6 +170,12 @@ export interface AccountStatus {
   subscriptionTier?: 'ULTRA' | 'PRO' | 'FREE' | 'ENTERPRISE'
   /** Human-readable plan name (e.g. `Google AI Ultra`, `Google AI Pro`). */
   subscriptionName?: string
+  /** Google asks the owner to verify this account before it serves again. */
+  verificationRequired?: boolean
+  /** Browser link that clears the verification, when upstream gave one. */
+  verificationUrl?: string
+  /** Upstream wording of the verification demand. */
+  verificationMessage?: string
   /** Models this account's own upstream endpoint actually entitles. */
   availableModels?: readonly { id: string; name: string; enabled: boolean }[]
   /** Models explicitly marked disabled by upstream for this account (e.g. `gemini-4-argon`). */

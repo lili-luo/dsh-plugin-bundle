@@ -22,6 +22,7 @@
 //   CALL_ALWAYSONLY <tool> <json>  reported call whose options only offer allow_always
 //   QUOTA                   fail a prompt carrying it with a quota JSON-RPC error
 //   RATELIMIT               fail a prompt carrying it with a 429 rate-limit JSON-RPC error stating a retry delay
+//   VERIFY                  fail a prompt carrying it with a Google account-verification JSON-RPC error
 //
 // `FAKE_AGY_EXTRA_MODELS` (comma list) appends effort-tiered families such as
 // `gemini-4-carbon` to the advertised catalog; `FAKE_AGY_ARGV` names a JSONL
@@ -622,6 +623,9 @@ rl.on('line', async (line) => {
       }
       if (failMode === 'ratelimit' && text.includes('RATELIMIT')) {
         return send({ jsonrpc: '2.0', id, error: { code: -32000, message: '429 Too Many Requests: model is overloaded, please retry in 2s' } })
+      }
+      if (failMode === 'verify' && text.includes('VERIFY')) {
+        return send({ jsonrpc: '2.0', id, error: { code: -32000, message: 'PERMISSION_DENIED: Verify your account to continue.' } })
       }
       const result = planEntries !== undefined && planCursor < planEntries.length
         ? await runPlanStage(s, planEntries[planCursor++])

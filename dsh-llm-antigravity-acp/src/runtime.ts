@@ -33,6 +33,7 @@ import {
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
   type AcpPromptBlock, type ImageResolver, type NativeSandboxMode, type NativeSessionContext,
 } from './history.ts'
+import type { CloudCodeTransport } from './cloudcode.ts'
 import { labeled } from './labels.ts'
 import { JsonRpcClosedError, JsonRpcRemoteError } from './jsonrpc.ts'
 import { McpBridge, type BridgeCallRequest, type BridgeContent, type BridgeTool, type BridgeToolResult } from './mcp-bridge.ts'
@@ -100,6 +101,8 @@ export interface RuntimeHost {
   onModelsChanged(): void
   /** Delay before a parked call answers with a still-running notice; overrides config.relayAfterMs (85 seconds). */
   relayAfterMs?: number
+  /** Optional Cloud Code HTTP transport override for tests. */
+  cloudCodeTransport?: CloudCodeTransport
 }
 
 /** Live configuration overrides applied through the Web settings card. */
@@ -229,7 +232,7 @@ export class AntigravityRuntime implements AccountAdmin {
       callTool: request => this.callTool(request),
       authorize: (tenantKey, bearerToken) => this.authorizeTenant(tenantKey, bearerToken),
     }, { keepAliveMs: host.config.keepAliveMs, log: message => host.log.info(message) })
-    this.quota = new QuotaReader(() => this.binary, host.runCommand, host.config.quotaTtlMs)
+    this.quota = new QuotaReader(() => this.binary, host.runCommand, host.config.quotaTtlMs, host.cloudCodeTransport)
     void this.refreshAccountEmails()
     this.sweeper = setInterval(() => this.sweep(), 60_000)
     this.sweeper.unref?.()
@@ -573,6 +576,7 @@ export class AntigravityRuntime implements AccountAdmin {
       slot.email = email
       if (email !== undefined && email.length > 0) {
         const snap = await this.quota.readFor(slot.layout.id, slot.env, false, slot.layout).catch(() => undefined)
+        if (snap !== undefined) noteVerification(slot, snap)
         if (snap !== undefined && snap.status === 'ok') {
           this.applyQuotaToSlot(slot, snap)
         }
@@ -666,6 +670,7 @@ export class AntigravityRuntime implements AccountAdmin {
     if (slot === undefined) return this.quota.read(force)
     if (!slot.layout.system && process.platform === 'darwin') await unlockAccountKeychain(slot.layout, this.host.runCommand)
     const snapshot = await this.quota.readFor(id, slot.env, force, slot.layout)
+    noteVerification(slot, snapshot)
     if (snapshot.status === 'ok') this.applyQuotaToSlot(slot, snapshot)
     return snapshot
   }
@@ -829,6 +834,11 @@ export class AntigravityRuntime implements AccountAdmin {
         cooldowns: this.pool.cooldowns(layout.id),
         sessions: sessions.get(layout.id) ?? 0,
         email: slot?.email ?? undefined,
+        ...(slot?.verification !== undefined ? {
+          verificationRequired: true,
+          ...(slot.verification.url !== undefined ? { verificationUrl: slot.verification.url } : {}),
+          verificationMessage: slot.verification.message,
+        } : {}),
         ...(slot?.subscriptionTier !== undefined ? { subscriptionTier: slot.subscriptionTier } : {}),
         ...(slot?.subscriptionName !== undefined ? { subscriptionName: slot.subscriptionName } : {}),
         availableModels: accountAvailable,
@@ -986,7 +996,7 @@ export class AntigravityRuntime implements AccountAdmin {
     slot.usage.totalTokens += Math.max(0, Math.round(usage.totalTokens ?? input + output))
   }
 
-  private slotCanServeModel(accountId: string, model: string, now = Date.now()): boolean {
+  private slotModelAndQuotaReady(accountId: string, model: string, now: number): boolean {
     if (!this.servesModel(accountId, model)) return false
     if (/argon/i.test(model) && this.pool.cooldownMs(accountId, 'argon', now) > 0) return false
     const slot = this.slots.get(accountId)
@@ -1014,6 +1024,16 @@ export class AntigravityRuntime implements AccountAdmin {
     return true
   }
 
+  private slotCanServeModel(accountId: string, model: string, now = Date.now()): boolean {
+    if (this.slots.get(accountId)?.verification !== undefined) return false
+    return this.slotModelAndQuotaReady(accountId, model, now)
+  }
+
+  private slotBlockedOnlyByVerification(accountId: string, model: string, now = Date.now()): boolean {
+    if (this.slots.get(accountId)?.verification === undefined) return false
+    return this.slotModelAndQuotaReady(accountId, model, now)
+  }
+
   /**
    * Stream one model step, failing over to another enabled account when the
    * chosen account hits a quota window or lacks model entitlement before any output is emitted.
@@ -1039,6 +1059,7 @@ export class AntigravityRuntime implements AccountAdmin {
     const family = familyForModel(options.model)
     const cooldownKey: CooldownKey = /argon/i.test(options.model) ? 'argon' : family
     const attempted = new Set<string>()
+    const recheckedVerification = new Set<string>()
     let conv: Conversation | undefined
     let emitted = false
     try {
@@ -1059,7 +1080,21 @@ export class AntigravityRuntime implements AccountAdmin {
           candidate => !attempted.has(candidate.id) && this.slotCanServeModel(candidate.id, options.model, now),
           id => liveByAccount.get(id) ?? 0,
         )
-        if (layout === undefined) throw this.poolExhausted(family, attempted, options.model, cooldownKey)
+        if (layout === undefined) {
+          const pendingVerify = this.pool.list().find(
+            c => c.enabled && !attempted.has(c.id) && !recheckedVerification.has(c.id)
+              && this.pool.cooldownMs(c.id, family, now) === 0
+              && this.slotBlockedOnlyByVerification(c.id, options.model, now),
+          )
+          if (pendingVerify !== undefined) {
+            recheckedVerification.add(pendingVerify.id)
+            const snap = await this.quotaFor(pendingVerify.id, true).catch(() => undefined)
+            if (snap?.status === 'ok' && this.slots.get(pendingVerify.id)?.verification === undefined) {
+              continue
+            }
+          }
+          throw this.poolExhausted(family, attempted, options.model, cooldownKey)
+        }
         const slot = this.slotFor(layout.id)
         try {
           for await (const chunk of this.attempt(conv, slot, options)) {
@@ -1082,6 +1117,21 @@ export class AntigravityRuntime implements AccountAdmin {
           // request instead of upstream quota: they must never cool an account
           // down, park one, or fail the step over to another account.
           if (isReanswerFailure(error)) throw error
+          if (isVerificationFailure(error)) {
+            const message = error instanceof Error ? error.message : String(error)
+            slot.verification = { message, url: slot.verification?.url, at: Date.now() }
+            // The prompt error carries no link; Cloud Code's 403 does.
+            void this.quotaFor(layout.id, true).catch(() => undefined)
+            await this.failover(conv, slot, options.model, attempted, {
+              reject: () => {
+                this.host.log.warn(`antigravity-acp: account "${layout.id}" needs Google account verification (${message})`)
+                return mapError(error)
+              },
+              log: `antigravity-acp: account "${layout.id}" needs Google account verification (${message}); failing over to another account`,
+              reason: 'The account serving this conversation requires Google account verification.',
+            })
+            continue
+          }
           const code = failureCode(error)
           if (code === 'RATE_LIMIT') {
             // Upstream overload, not an exhausted window: cool the account for
@@ -1510,8 +1560,23 @@ export class AntigravityRuntime implements AccountAdmin {
   }
 
   /** Explain why no account could serve a step, one line per account. */
-  private poolExhausted(family: Family, attempted: ReadonlySet<string>, model: string, cooldownKey: CooldownKey): LlmError {
+  private poolExhausted(family: Family, attempted: ReadonlySet<string>, model: string, cooldownKey: CooldownKey): Error {
     const now = Date.now()
+    const cooldownOf = (accountId: string): { remaining: number; familyRemaining: number; argonRemaining: number } => {
+      const familyRemaining = this.pool.cooldownMs(accountId, family, now)
+      const argonRemaining = cooldownKey === 'argon' || /argon/i.test(model) ? this.pool.cooldownMs(accountId, 'argon', now) : 0
+      return { remaining: Math.max(familyRemaining, argonRemaining), familyRemaining, argonRemaining }
+    }
+    const entitledEnabled = this.pool.list().filter(
+      layout => layout.enabled && this.servesModel(layout.id, model) && !this.accountDeniesModel(layout.id, model),
+    )
+    if (
+      entitledEnabled.length > 0
+      && entitledEnabled.every(layout => this.slots.get(layout.id)?.verification !== undefined && cooldownOf(layout.id).remaining <= 0)
+    ) {
+      const first = this.slots.get(entitledEnabled[0]!.id)!.verification!
+      return mapError(new Error(first.message))
+    }
     let retryAfterMs: number | undefined
     const rows = this.pool.list().map((layout) => {
       const failed = attempted.has(layout.id) ? ' (failed this step)' : ''
@@ -1519,9 +1584,10 @@ export class AntigravityRuntime implements AccountAdmin {
       if (!this.servesModel(layout.id, model) || this.accountDeniesModel(layout.id, model)) {
         return `${layout.id} not entitled to ${model}${failed}`
       }
-      const familyRemaining = this.pool.cooldownMs(layout.id, family, now)
-      const argonRemaining = cooldownKey === 'argon' || /argon/i.test(model) ? this.pool.cooldownMs(layout.id, 'argon', now) : 0
-      const remaining = Math.max(familyRemaining, argonRemaining)
+      const { remaining, familyRemaining, argonRemaining } = cooldownOf(layout.id)
+      if (this.slots.get(layout.id)?.verification !== undefined && remaining <= 0) {
+        return `${layout.id} needs Google account verification${failed}`
+      }
       if (remaining <= 0) return `${layout.id} unavailable${failed}`
       const parkedBucket: CooldownKey = argonRemaining > familyRemaining ? 'argon' : family
       const reason = this.pool.cooldownReason(layout.id, parkedBucket, now)
@@ -1667,6 +1733,10 @@ export class AntigravityRuntime implements AccountAdmin {
       slot.state = 'error'
       slot.error = error instanceof Error ? error.message : String(error)
       this.lastError = slot.error
+      if (isVerificationFailure(error)) {
+        slot.verification = { message: slot.error, url: slot.verification?.url, at: Date.now() }
+        void this.quotaFor(slot.layout.id, true).catch(() => undefined)
+      }
       throw mapError(error)
     }
   }
@@ -2497,6 +2567,7 @@ export class AntigravityRuntime implements AccountAdmin {
     slot.email = email
     this.quota.clear()
     const ok = email !== undefined || outcome.code === 0
+    if (ok) slot.verification = undefined
     return {
       ok,
       email,
@@ -2741,6 +2812,34 @@ function turnSettled(turn: AcpTurn, timeoutMs: number): Promise<void> {
 }
 
 /**
+ * Whether a failure is Google's account-verification demand (403 VALIDATION_REQUIRED).
+ * @param error - the failure.
+ * @returns true when the account owner must verify the account in a browser.
+ */
+function isVerificationFailure(error: unknown): boolean {
+  if ((error as { code?: unknown } | undefined)?.code === 'VALIDATION_REQUIRED') return true
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /VALIDATION_REQUIRED|verify your account/i.test(message)
+}
+
+/**
+ * Record or clear one account's pending verification from a quota snapshot.
+ * @param slot - account slot.
+ * @param snapshot - quota snapshot just read for it.
+ */
+function noteVerification(slot: AccountSlot, snapshot: QuotaSnapshot): void {
+  if (snapshot.verificationRequired === true) {
+    slot.verification = {
+      message: snapshot.error ?? 'Verify your account to continue.',
+      url: snapshot.verificationUrl ?? slot.verification?.url,
+      at: Date.now(),
+    }
+  } else if (snapshot.status === 'ok') {
+    slot.verification = undefined
+  }
+}
+
+/**
  * Map transport and agent failures onto stable DSH failure codes.
  * @param error - the failure.
  * @returns an LlmError.
@@ -2749,6 +2848,9 @@ export function mapError(error: unknown): Error {
   if (error instanceof LlmError) return error
   const message = error instanceof Error ? error.message : String(error)
   if (error instanceof JsonRpcClosedError) return new LlmError(labeled('TRANSPORT', `Antigravity ACP link closed: ${message}`), 'TRANSPORT', { cause: error })
+  if (/VALIDATION_REQUIRED|verify your account/i.test(message)) {
+    return new LlmError(`${message} Open Settings → Antigravity and use "Verify" on the account card to finish Google account verification.`, 'AUTH', { cause: error })
+  }
   if (/authentication required|not logged in|unauthenticated|sign in/i.test(message)) {
     return new LlmError(labeled('AUTH', message), 'AUTH', { cause: error })
   }

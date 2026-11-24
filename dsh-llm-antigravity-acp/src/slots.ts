@@ -44,6 +44,8 @@ export interface AccountSlot {
   maxTokensByModel: Record<string, number> | undefined
   /** Models explicitly marked disabled by upstream on this account. */
   disabledModels: string[] | undefined
+  /** Pending Google account verification (Cloud Code 403 `VALIDATION_REQUIRED`), if any. */
+  verification?: { message: string; url: string | undefined; at: number } | undefined
   /** Tokens reported for this account since the provider process started. */
   usage: { inputTokens: number; outputTokens: number; totalTokens: number }
 }

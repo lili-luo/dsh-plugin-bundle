@@ -35,6 +35,8 @@ export function permissionState(conv) {
         advertisedToolNames: conv.advertisedToolNames,
     };
 }
+/** Provider ids this plugin registered under, so transcripts saved under `antigravity-acp` also continue in place. */
+const LEGACY_PROVIDER_IDS = new Set(['antigravity', 'antigravity-acp']);
 /**
  * Whether one message is this provider's own earlier output rather than new input.
  * @param message - request message to classify.
@@ -43,8 +45,10 @@ export function permissionState(conv) {
  * @returns true for the model's own assistant text and for results of its own tool calls.
  */
 export function isOwnMessage(message, provider, issuedIds) {
-    if (message.role === 'assistant')
-        return message.source.kind === 'model' && message.source.provider === provider;
+    if (message.role === 'assistant') {
+        return message.source.kind === 'model'
+            && (message.source.provider === provider || LEGACY_PROVIDER_IDS.has(message.source.provider));
+    }
     if (message.role === 'tool')
         return issuedIds.has(message.toolCallId);
     return false;

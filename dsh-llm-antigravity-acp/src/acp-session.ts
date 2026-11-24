@@ -135,6 +135,9 @@ export function permissionState(conv: Conversation): PermissionGateState {
   }
 }
 
+/** Provider ids this plugin registered under, so transcripts saved under `antigravity-acp` also continue in place. */
+const LEGACY_PROVIDER_IDS: ReadonlySet<string> = new Set(['antigravity', 'antigravity-acp'])
+
 /**
  * Whether one message is this provider's own earlier output rather than new input.
  * @param message - request message to classify.
@@ -143,7 +146,10 @@ export function permissionState(conv: Conversation): PermissionGateState {
  * @returns true for the model's own assistant text and for results of its own tool calls.
  */
 export function isOwnMessage(message: RequestMessage, provider: string, issuedIds: ReadonlySet<string>): boolean {
-  if (message.role === 'assistant') return message.source.kind === 'model' && message.source.provider === provider
+  if (message.role === 'assistant') {
+    return message.source.kind === 'model'
+      && (message.source.provider === provider || LEGACY_PROVIDER_IDS.has(message.source.provider))
+  }
   if (message.role === 'tool') return issuedIds.has(message.toolCallId)
   return false
 }
