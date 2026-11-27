@@ -1,7 +1,7 @@
 {
   "name": "dsh-mistral-pool",
   "description": "Mistral Vibe 一级供应商与多 Key 池插件：内置可编辑模型目录、支持 ACP（vibe-acp）与直连 HTTP 代理一键切换、按优先级与权重调度轮换，无需手改 API 密钥与地址。",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "keywords": [
     "dsh",
     "dsh-plugin",

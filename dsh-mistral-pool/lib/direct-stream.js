@@ -8,12 +8,40 @@
  * @module dsh-mistral-pool/direct-stream
  */
 
-const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+import {
+  DEFAULT_IMAGE_OFFLOAD_COUNT_QUANTUM,
+  DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+  IMAGE_OFFLOAD_REQUIRED_CODE,
+  createStructuredError,
+  formatOffloadedImagePlaceholder,
+  isImageLimitUpstreamError,
+  reactiveImageOffloadCount,
+  requiredOffloadForRoles,
+} from './image-budget.js'
+import { resolveMaxRequestImages } from './adapter.js'
 
-function mapErrorCode(status) {
+const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+const CONTEXT_OVERFLOW_RE = /context[\s_-](?:length|window)[\s_-](?:exceed|overflow|limit)|maximum context length|too (?:long|large) for (?:this |the )?(?:model(?:'s)? )?context/i
+
+function parseRetryAfterMs(headerValue) {
+  if (!headerValue) return undefined
+  const trimmed = String(headerValue).trim()
+  if (!trimmed) return undefined
+  const seconds = Number(trimmed)
+  if (Number.isFinite(seconds) && seconds > 0) return Math.round(seconds * 1_000)
+  const dateMs = Date.parse(trimmed)
+  if (Number.isFinite(dateMs)) {
+    const delta = dateMs - Date.now()
+    return delta > 0 ? delta : undefined
+  }
+  return undefined
+}
+
+function mapErrorCode(status, errorCode = '', message = '') {
   if (status === 401 || status === 403) return 'AUTH'
   if (status === 402) return 'QUOTA'
   if (status === 429) return 'RATE_LIMIT'
+  if (status === 400 && CONTEXT_OVERFLOW_RE.test(`${errorCode}\n${message}`)) return 'CONTEXT_WINDOW_EXCEEDED'
   if (status >= 500) return 'SERVER'
   return 'PROVIDER_ERROR'
 }
@@ -64,7 +92,7 @@ function resolveActiveTools(options) {
  * Translate DSH `GenerateOptions` + pre-resolved image map into an OpenAI
  * Responses API JSON payload.
  */
-export function buildResponsesPayload(options, resolvedImages = new Map()) {
+export function buildResponsesPayload(options, resolvedImages = new Map(), opts = {}) {
   const instructionParts = []
   if (typeof options?.system === 'string' && options.system.trim() !== '') {
     instructionParts.push(options.system.trim())
@@ -88,15 +116,22 @@ export function buildResponsesPayload(options, resolvedImages = new Map()) {
         if (block.type === 'text') {
           parts.push({ type: 'input_text', text: String(block.text ?? '') })
         } else if (block.type === 'image') {
-          const resolved = block.offloaded ? null : resolvedImages.get(block)
-          if (resolved?.data && resolved?.mimeType) {
+          if (block.offloaded === true) {
             parts.push({
-              type: 'input_image',
-              image_url: `data:${resolved.mimeType};base64,${resolved.data}`,
+              type: 'input_text',
+              text: formatOffloadedImagePlaceholder(block.attachment, opts?.resolveImagePath?.(block.attachment)),
             })
           } else {
-            const label = block.attachment?.path || block.attachment?.name || 'image'
-            parts.push({ type: 'input_text', text: `[Image: ${label}]` })
+            const resolved = resolvedImages.get(block)
+            if (resolved?.data && resolved?.mimeType) {
+              parts.push({
+                type: 'input_image',
+                image_url: `data:${resolved.mimeType};base64,${resolved.data}`,
+              })
+            } else {
+              const label = block.attachment?.path || block.attachment?.name || 'image'
+              parts.push({ type: 'input_text', text: `[Image: ${label}]` })
+            }
           }
         } else if (block.type === 'file') {
           const path = block.attachment?.path || block.attachment?.name || 'file'
@@ -220,9 +255,36 @@ export async function* streamDirectResponses(options, deps = {}) {
     return
   }
 
+  const messages = Array.isArray(options?.messages) ? options.messages : []
+  const maxRequestImages = Number.isSafeInteger(deps.maxRequestImages) && deps.maxRequestImages > 0
+    ? deps.maxRequestImages
+    : resolveMaxRequestImages(options?.model)
+  const maxRequestImageBytes = deps.maxRequestImageBytes !== undefined
+    ? Number(deps.maxRequestImageBytes)
+    : DEFAULT_MAX_REQUEST_IMAGE_BYTES
+  const countQuantum = Number.isSafeInteger(deps.imageOffloadCountQuantum) && deps.imageOffloadCountQuantum > 0
+    ? deps.imageOffloadCountQuantum
+    : DEFAULT_IMAGE_OFFLOAD_COUNT_QUANTUM
+
+  const canSendImages = typeof deps.resolveImage === 'function'
+  if (canSendImages) {
+    const countOffload = requiredOffloadForRoles(
+      messages,
+      { maxImages: maxRequestImages, countQuantum },
+      { sentRoles: ['user'] },
+    )
+    if (countOffload > 0) {
+      throw createStructuredError(
+        `Mistral direct request images exceed the limit of ${maxRequestImages}; ${countOffload} more oldest occurrence(s) must be offloaded.`,
+        IMAGE_OFFLOAD_REQUIRED_CODE,
+        { offloadImages: countOffload },
+      )
+    }
+  }
+
   const resolvedImages = new Map()
-  if (typeof deps.resolveImage === 'function') {
-    for (const msg of options?.messages ?? []) {
+  if (canSendImages) {
+    for (const msg of messages) {
       if (msg?.role !== 'user' || !Array.isArray(msg.content)) continue
       for (const block of msg.content) {
         if (block?.type !== 'image' || block.offloaded) continue
@@ -232,8 +294,24 @@ export async function* streamDirectResponses(options, deps = {}) {
     }
   }
 
+  const sentImageCount = resolvedImages.size
+  if (sentImageCount > 0 && Number.isFinite(maxRequestImageBytes) && maxRequestImageBytes > 0) {
+    const byteOffload = requiredOffloadForRoles(
+      messages,
+      { maxImages: maxRequestImages, maxBytes: maxRequestImageBytes, countQuantum },
+      { sentRoles: ['user'], getBytes: (block) => resolvedImages.get(block)?.data?.length ?? 0 },
+    )
+    if (byteOffload > 0) {
+      throw createStructuredError(
+        `Mistral direct request images exceed the byte budget (${maxRequestImageBytes} bytes); ${byteOffload} more oldest occurrence(s) must be offloaded.`,
+        IMAGE_OFFLOAD_REQUIRED_CODE,
+        { offloadImages: byteOffload },
+      )
+    }
+  }
+
   const baseUrl = String(deps.baseUrl || 'http://127.0.0.1:28401/v1').replace(/\/+$/, '')
-  const payload = buildResponsesPayload(options, resolvedImages)
+  const payload = buildResponsesPayload(options, resolvedImages, { resolveImagePath: deps.resolveImagePath })
   const headers = {
     'content-type': 'application/json',
     authorization: 'Bearer pool-managed',
@@ -253,24 +331,45 @@ export async function* streamDirectResponses(options, deps = {}) {
       yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Request aborted', code: 'ABORTED' } } }
       return
     }
-    const err = new Error(`Mistral direct stream connection failed: ${error?.message ?? error}`)
-    err.code = 'TRANSPORT'
-    throw err
+    throw createStructuredError(
+      `Mistral direct stream connection failed: ${error?.message ?? error}`,
+      'TRANSPORT',
+      { cause: error },
+    )
   }
 
   if (!res.ok) {
     const bodyText = await res.text().catch(() => '')
     let message = bodyText.slice(0, 300) || `HTTP ${res.status}`
+    let errorCode = ''
     try {
       const parsed = JSON.parse(bodyText)
       message = parsed?.error?.message || parsed?.message || parsed?.detail || message
+      errorCode = String(parsed?.error?.code ?? parsed?.code ?? '')
     } catch {
       /* keep raw text */
     }
-    const err = new Error(message)
-    err.status = res.status
-    err.code = mapErrorCode(res.status)
-    throw err
+    if (isImageLimitUpstreamError({ status: res.status, code: errorCode, message, bodyText, sentImageCount })) {
+      const offloadImages = reactiveImageOffloadCount(messages, {
+        sentRoles: ['user'],
+        errorText: `${message}\n${bodyText}`,
+        countQuantum,
+      })
+      if (offloadImages > 0) {
+        throw createStructuredError(
+          `Mistral direct upstream rejected request images (${message.slice(0, 180)}); ${offloadImages} oldest image(s) must be offloaded.`,
+          IMAGE_OFFLOAD_REQUIRED_CODE,
+          { status: res.status, offloadImages },
+        )
+      }
+    }
+    const requestId = res.headers.get('x-request-id') || res.headers.get('request-id') || undefined
+    const providerRetryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'))
+    throw createStructuredError(
+      message,
+      mapErrorCode(res.status, errorCode, message),
+      { status: res.status, providerRetryAfterMs, requestId },
+    )
   }
 
   let nextIndex = 0
@@ -429,7 +528,26 @@ export async function* streamDirectResponses(options, deps = {}) {
     }
     if (type === 'response.failed' || type === 'error') {
       const msg = doc.response?.error?.message || doc.error?.message || doc.message || 'Mistral response failed'
-      finishedReason = { kind: 'error', failure: { message: msg, code: 'PROVIDER_ERROR' } }
+      const errCode = String(doc.response?.error?.code ?? doc.error?.code ?? doc.code ?? '')
+      if (nextIndex === 0 && isImageLimitUpstreamError({ code: errCode, message: msg, bodyText: dataStr, sentImageCount })) {
+        const offloadImages = reactiveImageOffloadCount(messages, {
+          sentRoles: ['user'],
+          errorText: `${msg}\n${dataStr}`,
+          countQuantum,
+        })
+        if (offloadImages > 0) {
+          finishedReason = {
+            kind: 'error',
+            failure: {
+              message: `Mistral direct upstream rejected request images (${msg.slice(0, 180)}); ${offloadImages} oldest image(s) must be offloaded.`,
+              code: IMAGE_OFFLOAD_REQUIRED_CODE,
+              offloadImages,
+            },
+          }
+          return
+        }
+      }
+      finishedReason = { kind: 'error', failure: { message: msg, code: mapErrorCode(400, errCode, msg) } }
     }
   }
 

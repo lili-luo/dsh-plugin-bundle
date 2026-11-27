@@ -703,3 +703,191 @@ test('settings client renders add-key form, empty-state add button, and inline d
   assert.match(schedRendered, /替换 API Key（选填，留空保持不变）/)
   assert.match(schedRendered, /保存修改/)
 })
+
+function makeAcpImage(id, offloaded = false) {
+  return {
+    type: 'image',
+    attachment: {
+      attachmentId: `sha256:${id.padEnd(64, '0')}`,
+      name: `${id}.png`,
+      mediaType: 'image/png',
+      width: 64,
+      height: 64,
+      bytes: 128,
+    },
+    ...(offloaded ? { offloaded: true } : {}),
+  }
+}
+
+test('ACP mode enforces 20-image budget across turns/tool screenshots, recovers from 3051, and surfaces -31007 guidance', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'pool-acp-images-'))
+  const exhaustedKeys = []
+  const runtime = new VibeAcpRuntime({
+    dshHome: home,
+    cacheDir: join(home, 'cache-vibe'),
+    sourceVibeHome: join(home, 'no-src'),
+    getUpstream: () => 'https://api.mistral.ai',
+    getVibeCommand: () => FAKE_VIBE_ACP,
+    selectVibeKey: () => makeKey('v1', 300),
+    exhaustKey: (k, reason) => exhaustedKeys.push({ id: k.id, reason }),
+    recordUsage: () => {},
+    resolveImage: async () => ({ data: 'AAAA', mimeType: 'image/png' }),
+    resolveImagePath: (ref) => `/ro/acp/${ref.name}`,
+  })
+
+  try {
+    // 1. 20 images across 5 user turns (4 each, respecting vibe-acp <= 8/msg) succeed.
+    const history20 = []
+    for (let t = 0; t < 5; t += 1) {
+      history20.push({
+        id: `u${t}`,
+        role: 'user',
+        source: { kind: 'user' },
+        content: [
+          ...Array.from({ length: 4 }, (_, j) => makeAcpImage(`t${t}i${j}`)),
+          { type: 'text', text: `ECHO_IMAGE_COUNT:turn${t}` },
+        ],
+      })
+      const chunks = await collect(runtime.stream({
+        provider: 'mistral-vibe',
+        model: 'deepseek-v4-1-flash-1017',
+        sessionId: 'sess-img-turns',
+        messages: [...history20],
+      }))
+      assert.equal(chunks.at(-1).reason.kind, 'stop')
+      const reply = chunks.find((c) => c.type === 'text-delta').text
+      assert.match(reply, /imgs=4/)
+      history20.push({
+        id: `a${t}`,
+        role: 'assistant',
+        source: { kind: 'model', provider: 'mistral-vibe', model: 'deepseek-v4-1-flash-1017' },
+        content: [{ type: 'text', text: reply }],
+      })
+    }
+
+    // 2. 21st image triggers IMAGE_OFFLOAD_REQUIRED (offloadImages === 4).
+    const history21 = [
+      ...history20,
+      {
+        id: 'u5',
+        role: 'user',
+        source: { kind: 'user' },
+        content: [makeAcpImage('t5i0'), { type: 'text', text: 'ECHO_IMAGE_COUNT:turn5' }],
+      },
+    ]
+    const over21 = await collect(runtime.stream({
+      provider: 'mistral-vibe',
+      model: 'deepseek-v4-1-flash-1017',
+      sessionId: 'sess-img-turns',
+      messages: history21,
+    }))
+    assert.equal(over21.at(-1).reason.kind, 'error')
+    assert.equal(over21.at(-1).reason.failure.code, 'IMAGE_OFFLOAD_REQUIRED')
+    assert.equal(over21.at(-1).reason.failure.offloadImages, 4)
+
+    // 3. After marking the first 4 images offloaded, retry rebuilds session with read-only paths and succeeds.
+    const retried21 = history21.map((m, idx) => (idx === 0
+      ? { ...m, content: m.content.map((b) => (b.type === 'image' ? { ...b, offloaded: true } : b)) }
+      : idx === history21.length - 1
+        ? { ...m, content: m.content.map((b) => (b.type === 'text' ? { ...b, text: 'ECHO_IMAGE_COUNT:ECHO_RO_PATH:turn5' } : b)) }
+        : m))
+    const ok21 = await collect(runtime.stream({
+      provider: 'mistral-vibe',
+      model: 'deepseek-v4-1-flash-1017',
+      sessionId: 'sess-img-turns',
+      messages: retried21,
+    }))
+    assert.equal(ok21.at(-1).reason.kind, 'stop')
+    const ok21Text = ok21.find((c) => c.type === 'text-delta').text
+    assert.match(ok21Text, /has_ctx=true:imgs=1:ro=\/ro\/acp\/t0i0\.png/)
+
+    // 4. Parked tool-result screenshot exceeding 20 triggers IMAGE_OFFLOAD_REQUIRED and preserves fresh tool screenshot on rebuild.
+    const tools = [{ name: 'read', description: 'Read file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }]
+    const toolMsgs = [
+      { id: 'tu0', role: 'user', source: { kind: 'user' }, content: [...Array.from({ length: 8 }, (_, i) => makeAcpImage(`tu0_${i}`)), { type: 'text', text: 'go' }] },
+      { id: 'ta0', role: 'assistant', source: { kind: 'model', provider: 'mistral-vibe', model: 'deepseek-v4-1-flash-1017' }, content: [{ type: 'text', text: 'ok' }] },
+      { id: 'tu1', role: 'user', source: { kind: 'user' }, content: [...Array.from({ length: 8 }, (_, i) => makeAcpImage(`tu1_${i}`)), { type: 'text', text: 'go2' }] },
+      { id: 'ta1', role: 'assistant', source: { kind: 'model', provider: 'mistral-vibe', model: 'deepseek-v4-1-flash-1017' }, content: [{ type: 'text', text: 'ok2' }] },
+      { id: 'tu2', role: 'user', source: { kind: 'user' }, content: [...Array.from({ length: 4 }, (_, i) => makeAcpImage(`tu2_${i}`)), { type: 'text', text: 'ECHO_IMAGE_COUNT:TRIGGER_TOOL_SCREENSHOT' }] },
+    ]
+    const stepTool = await collect(runtime.stream({
+      provider: 'mistral-vibe',
+      model: 'deepseek-v4-1-flash-1017',
+      sessionId: 'sess-img-tool',
+      tools,
+      messages: toolMsgs,
+    }))
+    assert.equal(stepTool.at(-1).reason.kind, 'tool-calls')
+    const callBlock = stepTool.find((c) => c.type === 'block-end' && c.block.type === 'tool-call').block
+    const toolStepWith21 = [
+      ...toolMsgs,
+      { id: 'ta2', role: 'assistant', source: { kind: 'model', provider: 'mistral-vibe', model: 'deepseek-v4-1-flash-1017' }, content: [callBlock] },
+      { id: 'tt2', role: 'tool', source: { kind: 'tool', callId: callBlock.id }, toolCallId: callBlock.id, content: [makeAcpImage('shot_new'), { type: 'text', text: 'shot_ok' }] },
+    ]
+    const toolOver = await collect(runtime.stream({
+      provider: 'mistral-vibe',
+      model: 'deepseek-v4-1-flash-1017',
+      sessionId: 'sess-img-tool',
+      tools,
+      messages: toolStepWith21,
+    }))
+    assert.equal(toolOver.at(-1).reason.kind, 'error')
+    assert.equal(toolOver.at(-1).reason.failure.code, 'IMAGE_OFFLOAD_REQUIRED')
+    assert.equal(toolOver.at(-1).reason.failure.offloadImages, 4)
+
+    // Mark oldest 4 in tu0 offloaded -> rebuild sends trailing tool screenshot cleanly.
+    const toolRetried = toolStepWith21.map((m, idx) => {
+      if (idx !== 0) return m
+      let off = 0
+      return {
+        ...m,
+        content: m.content.map((b) => (b.type === 'image' && off++ < 4 ? { ...b, offloaded: true } : b)),
+      }
+    })
+    const toolResumed = await collect(runtime.stream({
+      provider: 'mistral-vibe',
+      model: 'deepseek-v4-1-flash-1017',
+      sessionId: 'sess-img-tool',
+      tools,
+      messages: toolRetried,
+    }))
+    assert.equal(toolResumed.at(-1).reason.kind, 'stop')
+    assert.match(toolResumed.find((c) => c.type === 'text-delta').text, /imgs=1/)
+
+    // 5. Reactive upstream 400 / code 3051 -> IMAGE_OFFLOAD_REQUIRED without exhausting key.
+    const reactive3051 = await collect(runtime.stream({
+      provider: 'mistral-vibe',
+      model: 'deepseek-v4-1-flash-1017',
+      sessionId: 'sess-3051',
+      messages: [{
+        id: 'r1',
+        role: 'user',
+        source: { kind: 'user' },
+        content: [...Array.from({ length: 6 }, (_, i) => makeAcpImage(`r${i}`)), { type: 'text', text: 'TRIGGER_UPSTREAM_3051' }],
+      }],
+    }))
+    assert.equal(reactive3051.at(-1).reason.kind, 'error')
+    assert.equal(reactive3051.at(-1).reason.failure.code, 'IMAGE_OFFLOAD_REQUIRED')
+    assert.equal(reactive3051.at(-1).reason.failure.offloadImages, 4)
+
+    // 6. vibe-acp -31007 (single-message 8-image limit) -> INVALID_REQUEST with actionable guidance, no key exhaustion.
+    const tooManyLocal = await collect(runtime.stream({
+      provider: 'mistral-vibe',
+      model: 'deepseek-v4-1-flash-1017',
+      sessionId: 'sess-31007',
+      messages: [{
+        id: 'l1',
+        role: 'user',
+        source: { kind: 'user' },
+        content: [...Array.from({ length: 10 }, (_, i) => makeAcpImage(`l${i}`)), { type: 'text', text: 'TRIGGER_VIBE_TOO_MANY_IMAGES' }],
+      }],
+    }))
+    assert.equal(tooManyLocal.at(-1).reason.kind, 'error')
+    assert.equal(tooManyLocal.at(-1).reason.failure.code, 'INVALID_REQUEST')
+    assert.match(tooManyLocal.at(-1).reason.failure.message, /8 张图片/)
+    assert.match(tooManyLocal.at(-1).reason.failure.message, /直连模式/)
+    assert.equal(exhaustedKeys.length, 0)
+  } finally {
+    await runtime.dispose()
+  }
+})

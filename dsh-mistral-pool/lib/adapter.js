@@ -8,6 +8,8 @@
  * @module dsh-mistral-pool/adapter
  */
 
+import { DEFAULT_MAX_REQUEST_IMAGES } from './image-budget.js'
+
 export const DEFAULT_CONTEXT_WINDOW = 1_048_576
 export const DEFAULT_MAX_TOKENS = 131_072
 
@@ -145,8 +147,8 @@ export const MODEL_PRESETS = [
   ['codestral', { name: 'Codestral', contextWindow: 256_000, maxTokens: 8_192, input: ['text'], efforts: [] }],
   ['magistral-medium', { name: 'Magistral Medium', contextWindow: 262_144, maxTokens: 16_384, input: ['text', 'image'], efforts: ['off', 'high'], defaultEffort: 'high' }],
   ['magistral', { name: 'Magistral', contextWindow: 262_144, maxTokens: 16_384, input: ['text', 'image'], efforts: ['off', 'high'], defaultEffort: 'high' }],
-  ['pixtral-large', { name: 'Pixtral Large', contextWindow: 128_000, maxTokens: 128_000, input: ['text', 'image'], efforts: [] }],
-  ['pixtral', { name: 'Pixtral 12B', contextWindow: 128_000, maxTokens: 128_000, input: ['text', 'image'], efforts: [] }],
+  ['pixtral-large', { name: 'Pixtral Large', contextWindow: 128_000, maxTokens: 128_000, input: ['text', 'image'], efforts: [], maxRequestImages: 8 }],
+  ['pixtral', { name: 'Pixtral 12B', contextWindow: 128_000, maxTokens: 128_000, input: ['text', 'image'], efforts: [], maxRequestImages: 8 }],
   ['ministral-3b', { name: 'Ministral 3 3B', contextWindow: 131_072, maxTokens: 128_000, input: ['text', 'image'], efforts: [] }],
   ['ministral-8b-2512', { name: 'Ministral 3 8B', contextWindow: 262_144, maxTokens: 262_144, input: ['text', 'image'], efforts: [] }],
   ['ministral-14b-2512', { name: 'Ministral 3 14B', contextWindow: 262_144, maxTokens: 262_144, input: ['text', 'image'], efforts: [] }],
@@ -168,6 +170,15 @@ export function presetForModel(id) {
     if (tail === prefix || tail.startsWith(prefix)) return preset
   }
   return null
+}
+
+/** Resolve per-request image count limit for a model from catalog override, preset, or default (20). */
+export function resolveMaxRequestImages(modelId, modelEntry) {
+  const rawOverride = Number(modelEntry?.maxRequestImages)
+  if (Number.isInteger(rawOverride) && rawOverride > 0) return rawOverride
+  const presetCap = Number(presetForModel(modelId)?.maxRequestImages)
+  if (Number.isInteger(presetCap) && presetCap > 0) return presetCap
+  return DEFAULT_MAX_REQUEST_IMAGES
 }
 
 const DIRECT_RETRY_POLICY = {
@@ -206,6 +217,10 @@ export function normalizeModelEntry(raw) {
       : efforts.includes('high')
         ? 'high'
         : efforts[efforts.length - 1]
+  const rawMaxImages = Number(raw?.maxRequestImages)
+  const maxRequestImages = Number.isInteger(rawMaxImages) && rawMaxImages > 0
+    ? rawMaxImages
+    : (Number.isInteger(preset?.maxRequestImages) && preset.maxRequestImages > 0 ? preset.maxRequestImages : undefined)
   return {
     id,
     name,
@@ -214,6 +229,7 @@ export function normalizeModelEntry(raw) {
     input: input.length > 0 ? input : ['text'],
     efforts,
     ...(defaultEffort ? { defaultEffort } : {}),
+    ...(maxRequestImages !== undefined ? { maxRequestImages } : {}),
     enabled: raw?.enabled !== false,
   }
 }

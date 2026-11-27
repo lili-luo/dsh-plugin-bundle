@@ -43,6 +43,8 @@ import {
   removeModel,
   resetModels,
   resolvePrice,
+  resolveMaxRequestImages,
+  streamDirectResponses,
   rebase,
   migratePricing,
   probeBilling,
@@ -1618,5 +1620,202 @@ test('MistralAdapter registers provider mistral-vibe and streams responses in di
   } finally {
     for (const c of ctx._cleanups ?? []) await c?.()
     await new Promise((done) => upstream.close(done))
+  }
+})
+
+function makeImgBlock(id, offloaded = false) {
+  return {
+    type: 'image',
+    attachment: {
+      attachmentId: `sha256:${id.padEnd(64, '0')}`,
+      name: `${id}.png`,
+      mediaType: 'image/png',
+      width: 64,
+      height: 64,
+      bytes: 128,
+    },
+    ...(offloaded ? { offloaded: true } : {}),
+  }
+}
+
+test('resolveMaxRequestImages resolves per-model presets and custom overrides', () => {
+  assert.equal(resolveMaxRequestImages('deepseek-v4-1-flash-1017'), 20)
+  assert.equal(resolveMaxRequestImages('pixtral-large-latest'), 8)
+  assert.equal(resolveMaxRequestImages('pixtral-12b-2409'), 8)
+  assert.equal(resolveMaxRequestImages('deepseek-v4-1-flash-1017', { maxRequestImages: 12 }), 12)
+
+  const pixtral = normalizeModelEntry({ id: 'pixtral-large-latest' })
+  assert.equal(pixtral.maxRequestImages, 8)
+  const flash = normalizeModelEntry({ id: 'deepseek-v4-1-flash-1017' })
+  assert.equal(flash.maxRequestImages, undefined)
+
+  const store = { keys: [key('a', { faceUsd: 300 })] }
+  const updated = updateModel(store, 'deepseek-v4-1-flash-1017', { maxRequestImages: 15 })
+  assert.equal(updated.maxRequestImages, 15)
+  const cleared = updateModel(store, 'deepseek-v4-1-flash-1017', { maxRequestImages: null })
+  assert.equal(cleared.maxRequestImages, undefined)
+  assert.throws(() => updateModel(store, 'deepseek-v4-1-flash-1017', { maxRequestImages: 0 }), (e) => e.status === 400)
+})
+
+test('streamDirectResponses enforces image count/byte budgets, aligns tool images, and recovers from 400/3051', async () => {
+  const seenPayloads = []
+  let upstreamMode = 'ok'
+  const upstream = createServer((req, res) => {
+    let body = ''
+    req.on('data', (c) => { body += c })
+    req.on('end', () => {
+      const parsed = JSON.parse(body || '{}')
+      seenPayloads.push(parsed)
+      if (upstreamMode === '3051') {
+        res.writeHead(400, { 'content-type': 'application/json', 'x-request-id': 'req_3051' })
+        res.end(JSON.stringify({ error: { code: '3051', message: 'Invalid argument: too many images' } }))
+        return
+      }
+      if (upstreamMode === '429') {
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '12', 'x-request-id': 'req_429' })
+        res.end(JSON.stringify({ error: { message: 'Rate limited' } }))
+        return
+      }
+      if (upstreamMode === '500') {
+        res.writeHead(500, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: 'Upstream down' } }))
+        return
+      }
+      if (upstreamMode === '401') {
+        res.writeHead(401, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: 'Unauthorized' } }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n')
+      res.write('event: response.completed\ndata: {"type":"response.completed","response":{"model":"deepseek-v4-1-flash-1017","usage":{"input_tokens":10,"output_tokens":2}}}\n\n')
+      res.end()
+    })
+  })
+  await new Promise((done) => upstream.listen(0, '127.0.0.1', done))
+
+  const baseUrl = `http://127.0.0.1:${upstream.address().port}/v1`
+  const resolveImage = async () => ({ data: 'AAAA', mimeType: 'image/png' })
+  const collect = async (iter) => {
+    const out = []
+    for await (const item of iter) out.push(item)
+    return out
+  }
+
+  try {
+    // 1. 20 user images pass without offload.
+    const msg20 = [{ role: 'user', content: Array.from({ length: 20 }, (_, i) => makeImgBlock(`i${i}`)) }]
+    const ok20 = await collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: msg20 }, { baseUrl, resolveImage }))
+    assert.equal(ok20.at(-1).reason.kind, 'stop')
+    assert.equal(seenPayloads.at(-1).input[0].content.filter((p) => p.type === 'input_image').length, 20)
+
+    // 2. 21st user image triggers IMAGE_OFFLOAD_REQUIRED (quantum 4) before any fetch/image read.
+    let readCalls = 0
+    const msg21 = [{ role: 'user', content: Array.from({ length: 21 }, (_, i) => makeImgBlock(`i${i}`)) }]
+    await assert.rejects(
+      async () => collect(streamDirectResponses(
+        { model: 'deepseek-v4-1-flash-1017', messages: msg21 },
+        { baseUrl, resolveImage: async () => { readCalls += 1; return { data: 'AAAA', mimeType: 'image/png' } } },
+      )),
+      (err) => err.code === 'IMAGE_OFFLOAD_REQUIRED'
+        && err.failure?.code === 'IMAGE_OFFLOAD_REQUIRED'
+        && err.failure?.offloadImages === 4,
+    )
+    assert.equal(readCalls, 0)
+
+    // 3. Marking 4 oldest offloaded succeeds on retry with 17 input_image + 4 placeholders (with/without read-only path).
+    const msg21Offloaded = [{
+      role: 'user',
+      content: Array.from({ length: 21 }, (_, i) => makeImgBlock(`i${i}`, i < 4)),
+    }]
+    await collect(streamDirectResponses(
+      { model: 'deepseek-v4-1-flash-1017', messages: msg21Offloaded },
+      { baseUrl, resolveImage, resolveImagePath: (ref) => `/ro/attachments/${ref.name}` },
+    ))
+    const lastParts = seenPayloads.at(-1).input[0].content
+    assert.equal(lastParts.filter((p) => p.type === 'input_image').length, 17)
+    const pathPlaceholders = lastParts.filter(
+      (p) => p.type === 'input_text' && p.text.includes('Normalized copy (read-only;') && p.text.includes('/ro/attachments/i0.png'),
+    )
+    assert.equal(pathPlaceholders.length, 1)
+    assert.equal(
+      lastParts.filter((p) => p.type === 'input_text' && p.text.includes('image omitted to fit request image limits') && p.text.includes('64x64px, image/png')).length,
+      4,
+    )
+
+    // Without resolveImagePath, falls back cleanly to no-path placeholder.
+    await collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: msg21Offloaded }, { baseUrl, resolveImage }))
+    assert.ok(
+      seenPayloads.at(-1).input[0].content.some(
+        (p) => p.type === 'input_text' && p.text.includes('No local normalized image path is available'),
+      ),
+    )
+
+    // 4. Surface alignment: 3 un-offloaded tool images before 21 user images -> offloadImages === 7.
+    const alignedMsgs = [
+      { role: 'tool', toolCallId: 'c1', content: [makeImgBlock('t0'), makeImgBlock('t1'), makeImgBlock('t2')] },
+      { role: 'user', content: Array.from({ length: 21 }, (_, i) => makeImgBlock(`u${i}`)) },
+    ]
+    await assert.rejects(
+      async () => collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: alignedMsgs }, { baseUrl, resolveImage })),
+      (err) => err.code === 'IMAGE_OFFLOAD_REQUIRED' && err.failure?.offloadImages === 7,
+    )
+
+    // 5. Base64 byte budget triggers IMAGE_OFFLOAD_REQUIRED.
+    const smallMsgs = [{ role: 'user', content: [makeImgBlock('b0'), makeImgBlock('b1'), makeImgBlock('b2')] }]
+    await assert.rejects(
+      async () => collect(streamDirectResponses(
+        { model: 'deepseek-v4-1-flash-1017', messages: smallMsgs },
+        { baseUrl, maxRequestImageBytes: 10, resolveImage: async () => ({ data: '123456', mimeType: 'image/png' }) },
+      )),
+      (err) => err.code === 'IMAGE_OFFLOAD_REQUIRED' && err.failure?.offloadImages === 2,
+    )
+
+    // 6. Reactive HTTP 400 / code 3051 with >= 2 images -> IMAGE_OFFLOAD_REQUIRED (no key exhaustion).
+    upstreamMode = '3051'
+    const nineMsgs = [{ role: 'user', content: Array.from({ length: 9 }, (_, i) => makeImgBlock(`r${i}`)) }]
+    await assert.rejects(
+      async () => collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: nineMsgs }, { baseUrl, resolveImage })),
+      (err) => err.code === 'IMAGE_OFFLOAD_REQUIRED' && err.failure?.offloadImages === 4,
+    )
+
+    // Reactive 3051 with only 1 image must NOT trigger image offload.
+    const oneMsg = [{ role: 'user', content: [makeImgBlock('single')] }]
+    await assert.rejects(
+      async () => collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: oneMsg }, { baseUrl, resolveImage })),
+      (err) => err.code === 'PROVIDER_ERROR' && err.failure?.code === 'PROVIDER_ERROR' && err.failure?.status === 400,
+    )
+
+    // 7. Structured failure propagation for 429, 500, 401, and TRANSPORT.
+    upstreamMode = '429'
+    await assert.rejects(
+      async () => collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }, { baseUrl })),
+      (err) => err.code === 'RATE_LIMIT'
+        && err.failure?.code === 'RATE_LIMIT'
+        && err.failure?.status === 429
+        && err.failure?.providerRetryAfterMs === 12_000
+        && err.failure?.requestId === 'req_429',
+    )
+
+    upstreamMode = '500'
+    await assert.rejects(
+      async () => collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }, { baseUrl })),
+      (err) => err.code === 'SERVER' && err.failure?.code === 'SERVER' && err.failure?.status === 500,
+    )
+
+    upstreamMode = '401'
+    await assert.rejects(
+      async () => collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }, { baseUrl })),
+      (err) => err.code === 'AUTH' && err.failure?.code === 'AUTH' && err.failure?.status === 401,
+    )
+
+    await new Promise((done) => upstream.close(done))
+    await assert.rejects(
+      async () => collect(streamDirectResponses({ model: 'deepseek-v4-1-flash-1017', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }, { baseUrl })),
+      (err) => err.code === 'TRANSPORT' && err.failure?.code === 'TRANSPORT',
+    )
+    return
+  } finally {
+    if (upstream.listening) await new Promise((done) => upstream.close(done))
   }
 })

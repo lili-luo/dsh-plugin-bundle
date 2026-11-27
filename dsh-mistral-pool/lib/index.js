@@ -32,11 +32,17 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { REQUEST_IMAGE_MAX_BYTES, VibeAcpRuntime } from './acp-runtime.js'
-import { DEFAULT_MODELS, MODEL_PRESETS, MistralAdapter, effectiveModels, normalizeModelEntry, presetForModel } from './adapter.js'
+import { DEFAULT_MODELS, MODEL_PRESETS, MistralAdapter, effectiveModels, normalizeModelEntry, presetForModel, resolveMaxRequestImages } from './adapter.js'
 import { streamDirectResponses } from './direct-stream.js'
 
-export { DEFAULT_MODELS, MODEL_PRESETS, MistralAdapter, effectiveModels, normalizeModelEntry, presetForModel } from './adapter.js'
+export { DEFAULT_MODELS, MODEL_PRESETS, MistralAdapter, effectiveModels, normalizeModelEntry, presetForModel, resolveMaxRequestImages } from './adapter.js'
 export { buildResponsesPayload, streamDirectResponses } from './direct-stream.js'
+export {
+  DEFAULT_IMAGE_OFFLOAD_COUNT_QUANTUM,
+  DEFAULT_MAX_REQUEST_IMAGES,
+  DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+  IMAGE_OFFLOAD_REQUIRED_CODE,
+} from './image-budget.js'
 
 /** Cordis plugin name and default provider metadata. */
 export const name = 'dsh-mistral-pool'
@@ -459,6 +465,15 @@ export function updateModel(store, modelId, input = {}) {
   }
   if (Array.isArray(input?.efforts)) {
     next.efforts = input.efforts
+  }
+  if (input?.maxRequestImages !== undefined) {
+    if (input.maxRequestImages === null || String(input.maxRequestImages).trim() === '') {
+      delete next.maxRequestImages
+    } else {
+      const mri = Number(input.maxRequestImages)
+      if (!Number.isInteger(mri) || mri <= 0) throw makeInputError('单次请求图片上限必须为正整数', 400)
+      next.maxRequestImages = mri
+    }
   }
 
   const normalized = normalizeModelEntry(next)
@@ -1926,12 +1941,28 @@ export function apply(ctx, config = {}) {
   const subprocess = () => ctx.get?.('subprocess')
   const sessions = () => ctx.get?.('sessions')
   const fsService = () => ctx.get?.('fs')
+  const resolveImagePath = (ref) => {
+    const att = attachments()
+    const fs = fsService()
+    if (!att || typeof att.imageHostPath !== 'function') return undefined
+    let hostPath
+    try {
+      hostPath = att.imageHostPath(ref)
+    } catch {
+      return undefined
+    }
+    if (!hostPath) return undefined
+    return typeof fs?.processPathFromHostPath === 'function'
+      ? fs.processPathFromHostPath(hostPath)
+      : hostPath
+  }
 
   const acpRuntime = new VibeAcpRuntime({
     dshHome,
     cacheDir: config.cacheDir,
     getUpstream: () => store.upstream ?? DEFAULT_UPSTREAM,
     getVibeCommand: () => config.vibeCommand ?? store.vibeCommand ?? '',
+    getModelEntry: (modelId) => effectiveModels(store).find((m) => m.id === modelId),
     selectVibeKey: async (affinity) => {
       await ensure()
       const chosen = selectKey(store, affinity, { mode: 'acp' })
@@ -1972,6 +2003,7 @@ export function apply(ctx, config = {}) {
         ? fs.processPathFromHostPath(hostPath)
         : hostPath
     },
+    resolveImagePath,
     isSubagentSession: (sessionId) => {
       const header = sessions()?.get?.(sessionId)?.header
       return header?.origin === 'subagent' || header?.parentSession !== undefined
@@ -2439,9 +2471,12 @@ export function apply(ctx, config = {}) {
             return { data: Buffer.from(image.data).toString('base64'), mimeType: image.mediaType }
           }
         : undefined
+      const modelEntry = effectiveModels(store).find((m) => m.id === options?.model)
       yield* streamDirectResponses(options, {
         baseUrl: `http://127.0.0.1:${port}/v1`,
         resolveImage,
+        resolveImagePath,
+        maxRequestImages: resolveMaxRequestImages(options?.model, modelEntry),
       })
     },
   })

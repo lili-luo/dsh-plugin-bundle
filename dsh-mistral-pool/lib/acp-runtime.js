@@ -33,7 +33,16 @@ import { freemem, homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
 import { JsonRpcClosedError, JsonRpcPeer, JsonRpcRemoteError } from './jsonrpc.js'
 import { McpBridge } from './mcp-bridge.js'
-import { presetForModel } from './adapter.js'
+import { presetForModel, resolveMaxRequestImages } from './adapter.js'
+import {
+  DEFAULT_IMAGE_OFFLOAD_COUNT_QUANTUM,
+  IMAGE_OFFLOAD_REQUIRED_CODE,
+  countRetainedImages,
+  formatOffloadedImagePlaceholder,
+  isImageLimitUpstreamError,
+  reactiveImageOffloadCount,
+  requiredOffloadForRoles,
+} from './image-budget.js'
 
 export const DEFAULT_IDLE_SESSION_TTL_MS = 480_000
 export const DEFAULT_SUBAGENT_SESSION_TTL_MS = 45_000
@@ -348,7 +357,7 @@ export class AcpError extends Error {
   /**
    * @param {string} message - diagnostic message.
    * @param {string} code - DSH `LlmFailure.code`.
-   * @param {{ status?: number, providerRetryAfterMs?: number, cause?: unknown }} [extra] - optional metadata.
+   * @param {{ status?: number, providerRetryAfterMs?: number, offloadImages?: number, cause?: unknown }} [extra] - optional metadata.
    */
   constructor(message, code, extra = {}) {
     super(message, extra.cause !== undefined ? { cause: extra.cause } : undefined)
@@ -359,6 +368,9 @@ export class AcpError extends Error {
       code,
       ...(extra.status !== undefined ? { status: extra.status } : {}),
       ...(extra.providerRetryAfterMs !== undefined ? { providerRetryAfterMs: extra.providerRetryAfterMs } : {}),
+      ...(code === IMAGE_OFFLOAD_REQUIRED_CODE && Number.isSafeInteger(extra.offloadImages) && extra.offloadImages > 0
+        ? { offloadImages: extra.offloadImages }
+        : {}),
     }
   }
 }
@@ -504,9 +516,10 @@ export function buildVibeChildEnv({ vibeHome, apiKey, extraEnv = {}, base = proc
 }
 
 /** Map a requested DSH reasoning effort to the nearest Vibe-supported effort for `modelId`. */
-export function resolveModelSpec(modelId) {
+export function resolveModelSpec(modelId, modelEntry) {
   const raw = String(modelId || 'zai-glm-5-3').trim()
-  if (KNOWN_MODELS[raw]) return KNOWN_MODELS[raw]
+  const maxRequestImages = resolveMaxRequestImages(raw, modelEntry)
+  if (KNOWN_MODELS[raw]) return { ...KNOWN_MODELS[raw], maxRequestImages }
   const preset = presetForModel(raw)
   if (preset) {
     const mappedEfforts = []
@@ -527,6 +540,7 @@ export function resolveModelSpec(modelId) {
       supportsImages: Array.isArray(preset.input) ? preset.input.includes('image') : true,
       maxContextLength,
       autoCompactThreshold,
+      maxRequestImages,
     }
   }
   return {
@@ -537,6 +551,7 @@ export function resolveModelSpec(modelId) {
     supportsImages: true,
     maxContextLength: 1_048_576,
     autoCompactThreshold: 950_000,
+    maxRequestImages,
   }
 }
 
@@ -795,7 +810,15 @@ function mapAcpError(error) {
     if (code === -31001) return new AcpError(msg, 'RATE_LIMIT', { status: 429 })
     if (code === -31004) return new AcpError(msg, 'CONTEXT_WINDOW_EXCEEDED')
     if (code === -31005) return new AcpError(msg, 'REFUSAL')
-    if (code === -31007 || code === -31008) return new AcpError(msg, 'INVALID_REQUEST')
+    if (code === -31007 || code === -31008) {
+      if (code === -31007 && /too many images/i.test(msg)) {
+        return new AcpError(
+          `Mistral Vibe ACP (vibe-acp) 单条消息最多支持 8 张图片，请分批发送（每次 ≤ 8 张），或在「设置 → Mistral Key 池」切换为直连模式。(${msg})`,
+          'INVALID_REQUEST',
+        )
+      }
+      return new AcpError(msg, 'INVALID_REQUEST')
+    }
     if (code === -31002) {
       return new AcpError(msg, /api[\s_-]?key|unauth/i.test(msg) ? 'AUTH' : 'PROVIDER_ERROR')
     }
@@ -854,7 +877,7 @@ function textOnlyImageFallback(ref) {
   return `[image omitted because this model accepts text only; attachment sha256:${short}]`
 }
 
-function renderBlocks(content, resolveFilePath) {
+function renderBlocks(content, resolveFilePath, resolveImagePath) {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return ''
   const parts = []
@@ -865,7 +888,11 @@ function renderBlocks(content, resolveFilePath) {
         if (block.text) parts.push(String(block.text))
         break
       case 'image':
-        parts.push(`[image ${block.attachment?.attachmentId ?? 'unknown'}${block.offloaded ? ' (offloaded)' : ''}]`)
+        if (block.offloaded === true) {
+          parts.push(formatOffloadedImagePlaceholder(block.attachment, resolveImagePath?.(block.attachment)))
+        } else {
+          parts.push(`[image ${block.attachment?.attachmentId ?? 'unknown'}]`)
+        }
         break
       case 'file':
         parts.push(formatFileHandleText(block.attachment, resolveFilePath?.(block.attachment)))
@@ -883,16 +910,16 @@ function renderBlocks(content, resolveFilePath) {
   return parts.join('\n')
 }
 
-function renderTranscript(messages, resolveFilePath) {
+function renderTranscript(messages, resolveFilePath, resolveImagePath) {
   const lines = []
   for (const msg of messages) {
     if (!msg) continue
     switch (msg.role) {
       case 'user':
-        lines.push(`<user>\n${renderBlocks(msg.content, resolveFilePath)}\n</user>`)
+        lines.push(`<user>\n${renderBlocks(msg.content, resolveFilePath, resolveImagePath)}\n</user>`)
         break
       case 'assistant': {
-        const text = renderBlocks((msg.content ?? []).filter((b) => b?.type !== 'tool-call' && b?.type !== 'reasoning'), resolveFilePath)
+        const text = renderBlocks((msg.content ?? []).filter((b) => b?.type !== 'tool-call' && b?.type !== 'reasoning'), resolveFilePath, resolveImagePath)
         if (text) lines.push(`<assistant>\n${text}\n</assistant>`)
         for (const block of msg.content ?? []) {
           if (block?.type === 'tool-call') {
@@ -902,15 +929,15 @@ function renderTranscript(messages, resolveFilePath) {
         break
       }
       case 'tool':
-        lines.push(`<tool_result id="${msg.toolCallId}"${msg.isError ? ' error="true"' : ''}>\n${renderBlocks(msg.content, resolveFilePath)}\n</tool_result>`)
+        lines.push(`<tool_result id="${msg.toolCallId}"${msg.isError ? ' error="true"' : ''}>\n${renderBlocks(msg.content, resolveFilePath, resolveImagePath)}\n</tool_result>`)
         break
       case 'developer': {
-        const text = renderBlocks(msg.content, resolveFilePath)
+        const text = renderBlocks(msg.content, resolveFilePath, resolveImagePath)
         if (text) lines.push(`<harness_notice>\n${text}\n</harness_notice>`)
         break
       }
       case 'system':
-        lines.push(`<system_update>\n${renderBlocks(msg.content, resolveFilePath)}\n</system_update>`)
+        lines.push(`<system_update>\n${renderBlocks(msg.content, resolveFilePath, resolveImagePath)}\n</system_update>`)
         break
       default:
         break
@@ -932,7 +959,7 @@ function contextBlock(system, tools, serverName) {
   return `<dsh_context>\n${parts.join('\n\n')}\n</dsh_context>\n\n`
 }
 
-async function toPromptBlocks(messages, supportsImages, resolveImage, resolveFilePath) {
+async function toPromptBlocks(messages, supportsImages, resolveImage, resolveFilePath, resolveImagePath) {
   const blocks = []
   for (const msg of messages) {
     if (!msg) continue
@@ -950,21 +977,28 @@ async function toPromptBlocks(messages, supportsImages, resolveImage, resolveFil
             else blocks.push({ type: 'text', text: `[image ${block.attachment?.attachmentId ?? 'unknown'} unavailable]` })
           }
         } else {
-          const text = renderBlocks([block], resolveFilePath)
+          const text = renderBlocks([block], resolveFilePath, resolveImagePath)
           if (text) blocks.push({ type: 'text', text })
         }
       }
     } else {
-      const rendered = renderTranscript([msg], resolveFilePath)
+      const rendered = renderTranscript([msg], resolveFilePath, resolveImagePath)
       if (rendered) blocks.push({ type: 'text', text: rendered })
+      if (msg.role === 'tool' && supportsImages && Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block?.type !== 'image' || block.offloaded === true) continue
+          const img = await resolveImage?.(block)
+          if (img) blocks.push({ type: 'image', data: img.data, mimeType: img.mimeType })
+        }
+      }
     }
   }
   return blocks
 }
 
-async function buildReplayPrompt({ system, tools, serverName, history, input, supportsImages, resolveImage, resolveFilePath, budgetBytes = REPLAY_BUDGET_BYTES }) {
+async function buildReplayPrompt({ system, tools, serverName, history, input, supportsImages, resolveImage, resolveFilePath, resolveImagePath, budgetBytes = REPLAY_BUDGET_BYTES }) {
   const header = contextBlock(system, tools, serverName)
-  const rawInputBlocks = await toPromptBlocks(input, supportsImages, resolveImage, resolveFilePath)
+  const rawInputBlocks = await toPromptBlocks(input, supportsImages, resolveImage, resolveFilePath, resolveImagePath)
   const inputBlocks = rawInputBlocks.length > 0 ? rawInputBlocks : [{ type: 'text', text: EMPTY_INPUT_CONTINUATION }]
   const headerBytes = Buffer.byteLength(header, 'utf8')
   const inputBytes = inputBlocks.reduce((n, b) => n + Buffer.byteLength(b.type === 'text' ? b.text : b.data, 'utf8'), 0)
@@ -980,7 +1014,7 @@ async function buildReplayPrompt({ system, tools, serverName, history, input, su
   let omitted = 0
   const reserve = 128
   for (let i = history.length - 1; i >= 0; i -= 1) {
-    const chunk = renderTranscript([history[i]], resolveFilePath)
+    const chunk = renderTranscript([history[i]], resolveFilePath, resolveImagePath)
     const bytes = Buffer.byteLength(chunk, 'utf8') + 2
     if (used + bytes + reserve <= remaining) {
       kept.unshift(chunk)
@@ -1045,7 +1079,7 @@ function truncateToolText(text, maxBytes = MAX_TOOL_RESULT_TEXT_BYTES) {
   return `${clipped}\n\n[truncated ${buf.length - maxBytes} bytes by dsh-mistral-pool ACP bridge]`
 }
 
-async function formatToolResult(msg, supportsImages, resolveImage, resolveFilePath) {
+async function formatToolResult(msg, supportsImages, resolveImage, resolveFilePath, resolveImagePath) {
   const content = []
   let textBytes = 0
   for (const block of msg.content ?? []) {
@@ -1062,7 +1096,7 @@ async function formatToolResult(msg, supportsImages, resolveImage, resolveFilePa
       if (img) content.push({ type: 'image', data: img.data, mimeType: img.mimeType })
       else content.push({ type: 'text', text: `[image ${block.attachment?.attachmentId ?? 'unknown'} unavailable]` })
     } else {
-      const txt = renderBlocks([block], resolveFilePath)
+      const txt = renderBlocks([block], resolveFilePath, resolveImagePath)
       if (txt) content.push({ type: 'text', text: txt })
     }
   }
@@ -1461,8 +1495,30 @@ export class VibeAcpRuntime {
       conv.activeTools = tools
       conv.toolNames = new Set(tools.map((t) => t.name))
 
-      const modelSpec = resolveModelSpec(options.model)
+      const modelEntry = this.host.getModelEntry?.(options.model)
+      const modelSpec = resolveModelSpec(options.model, modelEntry)
       const effort = resolveVibeEffort(options.reasoningEffort, modelSpec.thinkingLevels)
+      const countQuantum = Number.isSafeInteger(this.host.imageOffloadCountQuantum) && this.host.imageOffloadCountQuantum > 0
+        ? this.host.imageOffloadCountQuantum
+        : DEFAULT_IMAGE_OFFLOAD_COUNT_QUANTUM
+
+      if (modelSpec.supportsImages) {
+        const offloadImages = requiredOffloadForRoles(
+          split.messages,
+          { maxImages: modelSpec.maxRequestImages, countQuantum },
+          { sentRoles: ['user', 'tool'] },
+        )
+        if (offloadImages > 0) {
+          if (conv.turn) {
+            this.#dropTurn(conv, 'Image budget exceeded; offloading oldest images.')
+          }
+          throw new AcpError(
+            `Mistral ACP request images exceed the limit of ${modelSpec.maxRequestImages}; ${offloadImages} more oldest occurrence(s) must be offloaded.`,
+            IMAGE_OFFLOAD_REQUIRED_CODE,
+            { offloadImages },
+          )
+        }
+      }
 
       // Path 1: Resume a parked turn waiting on DSH tool execution.
       if (conv.turn && conv.turn.pendingCalls.size > 0) {
@@ -1473,8 +1529,28 @@ export class VibeAcpRuntime {
           if (delivered) {
             conv.knownIds = messageIds(split.messages)
             conv.knownDigests = split.messages.map(digestMessage)
-            yield* this.#pump(conv, options, signal)
-            return
+            const activeTurn = conv.turn
+            try {
+              yield* this.#pump(conv, options, signal)
+              return
+            } catch (error) {
+              if (aborted()) {
+                conv.turn = undefined
+                this.#resetSession(conv)
+                yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Request aborted', code: 'ABORTED' } } }
+                return
+              }
+              const offloadErr = this.#maybeImageOffloadError(error, activeTurn, split.messages, modelSpec)
+              if (offloadErr) {
+                conv.turn = undefined
+                this.#resetSession(conv)
+                throw offloadErr
+              }
+              const mapped = mapAcpError(error)
+              conv.turn = undefined
+              this.#resetSession(conv)
+              throw mapped
+            }
           }
         }
         this.#dropTurn(conv, 'Conversation or configuration changed while tool was pending; rebuilding ACP session.')
@@ -1523,8 +1599,9 @@ export class VibeAcpRuntime {
               supportsImages: modelSpec.supportsImages,
               resolveImage: this.host.resolveImage,
               resolveFilePath: this.host.resolveFilePath,
+              resolveImagePath: this.host.resolveImagePath,
             })
-          : await toPromptBlocks(plan.input, modelSpec.supportsImages, this.host.resolveImage, this.host.resolveFilePath)
+          : await toPromptBlocks(plan.input, modelSpec.supportsImages, this.host.resolveImage, this.host.resolveFilePath, this.host.resolveImagePath)
         const promptBlocks = blocks.length > 0 ? blocks : [{ type: 'text', text: EMPTY_INPUT_CONTINUATION }]
 
         conv.knownIds = messageIds(split.messages)
@@ -1552,6 +1629,12 @@ export class VibeAcpRuntime {
             this.#resetSession(conv)
             continue
           }
+          const offloadErr = this.#maybeImageOffloadError(error, turn, split.messages, modelSpec)
+          if (offloadErr) {
+            conv.turn = undefined
+            this.#resetSession(conv)
+            throw offloadErr
+          }
           const mapped = mapAcpError(error)
           if (isAcpKeyExhausted(error)) {
             await this.host.exhaustKey(selectedKey, mapped.message)
@@ -1575,6 +1658,40 @@ export class VibeAcpRuntime {
         }
       }
     }
+  }
+
+  #maybeImageOffloadError(error, turn, messages, modelSpec) {
+    if (!modelSpec?.supportsImages || turn?.produced) return null
+    if (error instanceof JsonRpcRemoteError && error.rpc.code === -31007) return null
+    const rawMsg = error instanceof JsonRpcRemoteError
+      ? String(error.rpc.message || '')
+      : (error instanceof Error ? error.message : String(error ?? ''))
+    let rawData = ''
+    if (error instanceof JsonRpcRemoteError && error.rpc?.data !== undefined) {
+      try {
+        rawData = typeof error.rpc.data === 'string' ? error.rpc.data : JSON.stringify(error.rpc.data)
+      } catch {
+        rawData = ''
+      }
+    }
+    const retainedCount = countRetainedImages(messages, { roles: ['user', 'tool'] })
+    if (!isImageLimitUpstreamError({ message: rawMsg, bodyText: rawData, sentImageCount: retainedCount })) {
+      return null
+    }
+    const countQuantum = Number.isSafeInteger(this.host.imageOffloadCountQuantum) && this.host.imageOffloadCountQuantum > 0
+      ? this.host.imageOffloadCountQuantum
+      : DEFAULT_IMAGE_OFFLOAD_COUNT_QUANTUM
+    const offloadImages = reactiveImageOffloadCount(messages, {
+      sentRoles: ['user', 'tool'],
+      errorText: `${rawMsg}\n${rawData}`,
+      countQuantum,
+    })
+    if (offloadImages <= 0) return null
+    return new AcpError(
+      `Mistral ACP upstream rejected request images (${rawMsg.slice(0, 180)}); ${offloadImages} oldest image(s) must be offloaded.`,
+      IMAGE_OFFLOAD_REQUIRED_CODE,
+      { status: 400, offloadImages },
+    )
   }
 
   #fingerprint(system, tools, model, effort) {
@@ -1905,7 +2022,7 @@ export class VibeAcpRuntime {
     for (const msg of trailing) {
       const call = pending.get(msg.toolCallId)
       pending.delete(msg.toolCallId)
-      const result = await formatToolResult(msg, supportsImages, this.host.resolveImage, this.host.resolveFilePath)
+      const result = await formatToolResult(msg, supportsImages, this.host.resolveImage, this.host.resolveFilePath, this.host.resolveImagePath)
       call.result.resolve(result)
     }
     return true

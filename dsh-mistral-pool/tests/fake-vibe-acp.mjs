@@ -99,6 +99,45 @@ async function handlePrompt(rpcId, params) {
   }
 
   try {
+    if (text.includes('TRIGGER_UPSTREAM_3051')) {
+      send({
+        id: rpcId,
+        error: { code: -32603, message: 'Mistral API error (HTTP 400, code 3051): too many images in request' },
+      })
+      return
+    }
+
+    if (text.includes('TRIGGER_VIBE_TOO_MANY_IMAGES')) {
+      send({
+        id: rpcId,
+        error: { code: -31007, message: 'Too many images: 10 > 8' },
+      })
+      return
+    }
+
+    if (text.includes('TRIGGER_TOOL_SCREENSHOT') && !text.includes('<tool_result')) {
+      const res = await mcpPost('tools/call', { name: 'read', arguments: { path: 'shot.png' } })
+      const contents = Array.isArray(res?.content) ? res.content : []
+      const resImgs = contents.filter((c) => c?.type === 'image').length
+      const txt = contents.filter((c) => c?.type === 'text').map((c) => c.text).join('|')
+      if (txt.includes('SIMULATE_3051')) {
+        send({
+          id: rpcId,
+          error: { code: -32603, message: 'Mistral API error (HTTP 400, code 3051): too many images in request' },
+        })
+        return
+      }
+      sendNotify('session/update', {
+        sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `shot:imgs=${resImgs}:txt=${txt}` },
+        },
+      })
+      send({ id: rpcId, result: { stopReason: 'end_turn', usage: { inputTokens: 20, outputTokens: 5 } } })
+      return
+    }
+
     if (text.includes('TRIGGER_PERMISSION')) {
       const denyRes = await requestClient('session/request_permission', {
         sessionId,
@@ -178,7 +217,7 @@ async function handlePrompt(rpcId, params) {
       return
     }
 
-    if (text.includes('TRIGGER_TOOL')) {
+    if (text.includes('TRIGGER_TOOL') && !text.includes('TRIGGER_TOOL_SCREENSHOT')) {
       sendNotify('session/update', {
         sessionId,
         update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'calling tool' } },
@@ -238,13 +277,17 @@ async function handlePrompt(rpcId, params) {
     })
     const activeMatch = /active_model\s*=\s*"([^"]+)"/.exec(configToml)
     const activeModel = activeMatch ? activeMatch[1] : 'unknown'
+    const imgCount = (params.prompt ?? []).filter((b) => b?.type === 'image').length
+    const imgSuffix = text.includes('ECHO_IMAGE_COUNT') ? `:imgs=${imgCount}` : ''
+    const roMatch = /Normalized copy \(read-only;[^)]*\):\s*"([^"]+)"/.exec(text)
+    const roSuffix = text.includes('ECHO_RO_PATH') && roMatch ? `:ro=${roMatch[1]}` : ''
     sendNotify('session/update', {
       sessionId,
       update: {
         sessionUpdate: 'agent_message_chunk',
         content: {
           type: 'text',
-          text: `ok:turn=${turnCount}:key=${apiKey.slice(-4)}:model=${activeModel}:has_ctx=${text.includes('<dsh_context>')}:body=${text.split('\n').pop()}`,
+          text: `ok:turn=${turnCount}:key=${apiKey.slice(-4)}:model=${activeModel}:has_ctx=${text.includes('<dsh_context>')}${imgSuffix}${roSuffix}:body=${text.split('\n').pop()}`,
         },
       },
     })

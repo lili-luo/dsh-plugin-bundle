@@ -65,6 +65,7 @@ dsh plugin --profile web add ./dsh-mistral-pool
 - **长耗时工具中继**：`run_typescript` 单次超时为 60s；当 DSH 工具（人工审批或长子代理）等待超过 `45s` 时返回 `[DSH_RELAY]` 指引，模型立即调用 `dsh_await_result` 继续等待同一 DSH 调用。
 - **生命周期与内存回收**：启动零进程；主会话空闲 8 分钟（480s）、子代理空闲 45 秒、无 `sessionId` 辅助调用 0 秒即收；低内存（`< 1.5 GiB`）收紧至 60s；接入全局 `dsh.acp.residentCoordinator.v1`（软上限 8）；`live-pids.json` 记录子进程并在启动时回收 `PPID=1` 残留 `vibe-acp`。
 - **透明故障轮换**：若模型输出前收到 `401/402/403` 或配额错误，自动将该 Vibe Key 标为 `exhausted` 并用下一把重放当前提示。
+- **图片请求上限与自动卸载**：默认单请求图片预算为 **20 张**（`pixtral-*` 预设为 **8 张**，单个模型可通过 `maxRequestImages` 覆盖；直连模式同时限制 base64 总载荷不超过 `20 MiB`）。超限或收到上游 `HTTP 400 / 错误码 3051` 图片超限错误时，按 `4` 张步长返回 `IMAGE_OFFLOAD_REQUIRED` 交由 `dsh-compaction-image-offload` 自动将最旧图片替换为占位文本（在 `attachments.imageHostPath` 可用时附带本机只读规范化路径与尺寸供模型按需回读）并重试，不误标 Key 耗尽；若 ACP 模式下单条消息超过 `vibe-acp` 本机 `8` 张硬上限（`-31007`），则给出切换直连模式或分批发送的提示。
 
 ## 代理与计价特性
 
