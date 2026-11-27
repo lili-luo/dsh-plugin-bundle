@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Mistral Key Pool",
+    "description": "Self-contained Mistral Vibe primary provider and multi-key pool for DSH: switch between official vibe-acp ($300 Vibe pool) and direct HTTP proxy ($30 Studio pool), manage keys with priority/weight routing, and use 9 preconfigured mainstream models out of the box."
+  }
+}
